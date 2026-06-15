@@ -113,7 +113,7 @@ class FakeBackendControllerWithSkew(FakeBackendController):
         box_names: list[str],
         estimate: bool,
         target_box_names: list[str] | None = None,
-    ) -> tuple[dict[str, str], go.FigureWidget]:
+    ) -> tuple[dict[str, str], go.FigureWidget, list[object]]:
         """Return fake skew results and record render parameters."""
         self.run_skew_measurement_calls.append(
             {
@@ -125,7 +125,7 @@ class FakeBackendControllerWithSkew(FakeBackendController):
                 "estimate": estimate,
             }
         )
-        return {"status": "ok"}, self.figure
+        return {"status": "ok"}, self.figure, [("BOX1", [(True, 100, 96)])]
 
     def update_skew(
         self,
@@ -377,7 +377,11 @@ def test_check_skew_renders_figure_widget_via_plotly_figure(
     rendered_figure = shown["figure"]
     assert isinstance(rendered_figure, go.Figure)
     assert isinstance(result, Result)
-    assert result == {"skew": {"status": "ok"}, "fig": figure_widget}
+    assert result == {
+        "skew": {"status": "ok"},
+        "fig": figure_widget,
+        "resync": [("BOX1", [(True, 100, 96)])],
+    }
     assert result.figure is figure_widget
     with pytest.warns(DeprecationWarning, match="figure` attribute"):
         assert result["fig"] is figure_widget

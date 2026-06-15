@@ -1059,8 +1059,8 @@ class Quel1BackendController(BackendController):
         box_names: list[str],
         target_box_names: list[str] | None = None,
         estimate: bool = True,
-    ) -> tuple[Any, Any]:
-        """Measure skew from YAML settings and return skew object and figure."""
+    ) -> tuple[Any, Any, Any]:
+        """Measure skew and return skew object, figure, and resync result."""
         return self._skew_manager.run_skew_measurement(
             skew_yaml_path=skew_yaml_path,
             box_yaml_path=box_yaml_path,

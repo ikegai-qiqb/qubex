@@ -56,9 +56,11 @@ class _FakeSkewSystem:
         self.boxes = boxes
         self._clockmaster = clockmaster
         self.resync_calls = 0
+        self.resync_result = [("clock", [(True, 100, 96)]), (True, 100)]
 
-    def resync(self) -> None:
+    def resync(self) -> list[object]:
         self.resync_calls += 1
+        return self.resync_result
 
 
 class _FakeSkewRuntime:
@@ -212,7 +214,7 @@ def test_run_skew_measurement_reuses_connected_boxes_without_reconnect() -> None
     )
     manager = Quel1SkewManager(runtime_context=cast(Any, runtime_context))
 
-    skew, fig = manager.run_skew_measurement(
+    skew, fig, resync_result = manager.run_skew_measurement(
         skew_yaml_path="skew.yaml",
         box_yaml_path="box.yaml",
         clockmaster_ip="192.0.2.1",
@@ -221,6 +223,8 @@ def test_run_skew_measurement_reuses_connected_boxes_without_reconnect() -> None
     )
 
     assert fig == {"figure": "ok"}
+    assert resync_result == skew.system.resync_result
+    assert skew.system.resync_calls == 1
     assert skew is _FakeSkewClass.created_runtimes[-1]
     assert sysdb.create_box_calls == []
     assert _FakeQuBEMasterClient.create_calls == []

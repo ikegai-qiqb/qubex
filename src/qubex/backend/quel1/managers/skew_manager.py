@@ -286,8 +286,8 @@ class Quel1SkewManager:
         box_names: list[str],
         target_box_names: list[str] | None = None,
         estimate: bool = True,
-    ) -> tuple[SkewRuntimeProtocol, Any]:
-        """Run skew measurement workflow and return skew runtime and plot figure."""
+    ) -> tuple[SkewRuntimeProtocol, Any, Any]:
+        """Run skew measurement and return runtime, plot, and resync result."""
         resolved_box_names = list(dict.fromkeys(box_names))
         resolved_target_box_names = (
             list(dict.fromkeys(target_box_names))
@@ -318,7 +318,7 @@ class Quel1SkewManager:
             console.print("Applying RF switch settings...")
             prepare()
         console.print("Resyncing skew system...")
-        skew.system.resync()
+        resync_result = skew.system.resync()
         console.print("Measuring skew targets...")
         skew.measure()
         if estimate:
@@ -327,7 +327,7 @@ class Quel1SkewManager:
         self._last_skew = skew
         console.print("Rendering skew plot...")
         fig = skew.plot()
-        return skew, fig
+        return skew, fig, resync_result
 
     @staticmethod
     def _restrict_skew_targets(

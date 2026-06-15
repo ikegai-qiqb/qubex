@@ -118,7 +118,7 @@ Do you want to continue?
 
     all_box_ids = list(dict.fromkeys([*target_box_ids, ref_port]))
     run_skew_measurement = _require_backend_callable("run_skew_measurement")
-    skew, fig = run_skew_measurement(
+    skew, fig, resync_result = run_skew_measurement(
         skew_yaml_path=skew_file_path,
         box_yaml_path=box_file_path,
         clockmaster_ip=clock_master_address,
@@ -138,6 +138,7 @@ Do you want to continue?
         data={
             "skew": skew,
             "fig": fig,
+            "resync": resync_result,
         },
         figure=fig,
     )
