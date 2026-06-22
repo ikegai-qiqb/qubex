@@ -32,6 +32,16 @@ from .gf_calibration import (
     gf_ramsey_experiment,
     obtain_gf_rabi_params,
 )
+from .gf_cr import (
+    calibrate_gf_zx90,
+    gf_bell_state_tomography,
+    gf_cr_hamiltonian_tomography,
+    gf_zx90_interleaved_randomized_benchmarking,
+    measure_gf_bell_state,
+    measure_gf_cr_dynamics,
+    obtain_gf_cr_params,
+    update_gf_cr_params,
+)
 from .measurement_induced_decay import measurement_induced_decay_experiment
 from .multipartite_entanglement import (
     create_1d_cluster_sequence,
@@ -94,6 +104,7 @@ __all__ = [
     "calibrate_gf_hpi_pulse",
     "calibrate_gf_pi_pulse",
     "calibrate_gf_pulse",
+    "calibrate_gf_zx90",
     "characterize_coarse_readout_parameters",
     "characterize_readout_parameters",
     "ckp_measurement_v2",
@@ -118,9 +129,12 @@ __all__ = [
     "fourier_analysis",
     "get_resistance_charge",
     "get_superconducting_gap",
+    "gf_bell_state_tomography",
     "gf_chevron_pattern",
+    "gf_cr_hamiltonian_tomography",
     "gf_rabi_experiment",
     "gf_ramsey_experiment",
+    "gf_zx90_interleaved_randomized_benchmarking",
     "ghz_state_tomography",
     "interleaved_purity_benchmarking",
     "ipb_experiment",
@@ -129,6 +143,8 @@ __all__ = [
     "measure_bell_states",
     "measure_chevron_pattern",
     "measure_cr_crosstalk",
+    "measure_gf_bell_state",
+    "measure_gf_cr_dynamics",
     "measure_ghz_state",
     "measure_graph_state",
     "measurement_induced_decay_experiment",
@@ -136,6 +152,7 @@ __all__ = [
     "measurement_induced_dephasing_experiment",
     "mqc_experiment",
     "obtain_anharmonicity_with_cr",
+    "obtain_gf_cr_params",
     "obtain_gf_rabi_params",
     "parity_oscillation",
     "partial_transpose",
@@ -156,5 +173,6 @@ __all__ = [
     "stark_t1_experiment",
     "sweep_readout_snr",
     "thermal_excitation_via_rabi",
+    "update_gf_cr_params",
     "visualize_graph",
 ]
