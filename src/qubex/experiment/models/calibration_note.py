@@ -7,6 +7,8 @@ from logging import getLogger
 from pathlib import Path
 from typing import Any, TypedDict
 
+from typing_extensions import NotRequired
+
 from qubex.experiment.experiment_constants import (
     CALIBRATION_DIR,
     CR_PARAMS,
@@ -83,6 +85,10 @@ class CrossResonanceParam(Parameter):
     cancel_phase: float
     cancel_beta: float
     rotary_amplitude: float
+    rotary_y: NotRequired[float]
+    cr_detuning: NotRequired[float]
+    control_frame_z: NotRequired[float]
+    target_frame_z: NotRequired[float]
     zx_rotation_rate: float
 
 

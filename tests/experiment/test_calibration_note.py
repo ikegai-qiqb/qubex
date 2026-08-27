@@ -186,6 +186,10 @@ def test_update_cr_param(tmp_path):
             "cancel_phase": 0.5,
             "cancel_beta": 0.5,
             "rotary_amplitude": 0.5,
+            "rotary_y": 0.1,
+            "cr_detuning": 0.002,
+            "control_frame_z": 0.3,
+            "target_frame_z": -0.4,
             "zx_rotation_rate": 0.5,
         },
     )
@@ -200,6 +204,10 @@ def test_update_cr_param(tmp_path):
     assert param["cancel_phase"] == 0.5
     assert param["cancel_beta"] == 0.5
     assert param["rotary_amplitude"] == 0.5
+    assert param.get("rotary_y") == 0.1
+    assert param.get("cr_detuning") == 0.002
+    assert param.get("control_frame_z") == 0.3
+    assert param.get("target_frame_z") == -0.4
     assert param["zx_rotation_rate"] == 0.5
 
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Collection
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import numpy as np
 from qxpulse import (
@@ -31,6 +31,33 @@ from qubex.system.target_type import TargetType
 from qubex.typing import TargetMap
 
 logger = logging.getLogger(__name__)
+
+
+def _append_local_z_corrections(
+    schedule: PulseSchedule,
+    *,
+    control_qubit: str,
+    target_qubit: str,
+    cr_drive_label: str,
+    control_frame_z: float,
+    target_frame_z: float,
+) -> PulseSchedule:
+    """Append local virtual-Z corrections at the end of a pulse schedule."""
+    if control_frame_z == 0.0 and target_frame_z == 0.0:
+        return schedule
+
+    labels = list(
+        dict.fromkeys([*schedule.labels, control_qubit, target_qubit, cr_drive_label])
+    )
+    with PulseSchedule(labels) as corrected_schedule:
+        corrected_schedule.call(schedule)
+        corrected_schedule.barrier()
+        if control_frame_z != 0.0:
+            corrected_schedule.add(control_qubit, VirtualZ(control_frame_z))
+        if target_frame_z != 0.0:
+            corrected_schedule.add(target_qubit, VirtualZ(target_frame_z))
+            corrected_schedule.add(cr_drive_label, VirtualZ(target_frame_z))
+    return corrected_schedule
 
 
 class PulseService:
@@ -544,6 +571,10 @@ class PulseService:
         cancel_phase: float | None = None,
         cancel_beta: float | None = None,
         rotary_amplitude: float | None = None,
+        rotary_y: float | None = None,
+        cr_detuning: float | None = None,
+        control_frame_z: float | None = None,
+        target_frame_z: float | None = None,
         echo: bool | None = None,
         x180: TargetMap[Waveform] | Waveform | None = None,
         x180_margin: float | None = None,
@@ -560,7 +591,26 @@ class PulseService:
             valid_days=self.ctx.calibration_valid_days,
         )
         if cr_param is None:
-            raise ValueError(f"CR parameters for {cr_label} are not stored.")
+            explicit_parameters = {
+                "cr_duration": cr_duration,
+                "cr_ramptime": cr_ramptime,
+                "cr_amplitude": cr_amplitude,
+                "cr_phase": cr_phase,
+                "cr_beta": cr_beta,
+                "cancel_amplitude": cancel_amplitude,
+                "cancel_phase": cancel_phase,
+                "cancel_beta": cancel_beta,
+                "rotary_amplitude": rotary_amplitude,
+            }
+            missing = [
+                name for name, value in explicit_parameters.items() if value is None
+            ]
+            if missing:
+                missing_text = ", ".join(missing)
+                raise ValueError(
+                    f"CR parameters for {cr_label} are not stored. "
+                    f"Provide all pulse parameters explicitly; missing: {missing_text}."
+                )
 
         if x180 is None:
             pi_pulse = self.x180(control_qubit)
@@ -569,28 +619,55 @@ class PulseService:
         else:
             pi_pulse = x180[control_qubit]
 
-        if cr_amplitude is None:
-            cr_amplitude = cr_param["cr_amplitude"]
-        if cr_duration is None:
-            cr_duration = cr_param["duration"]
-        if cr_ramptime is None:
-            cr_ramptime = cr_param["ramptime"]
-        if cr_phase is None:
-            cr_phase = cr_param["cr_phase"]
-        if cr_beta is None:
-            cr_beta = cr_param["cr_beta"]
-        if cancel_amplitude is None:
-            cancel_amplitude = cr_param["cancel_amplitude"]
-        if cancel_phase is None:
-            cancel_phase = cr_param["cancel_phase"]
-        if cancel_beta is None:
-            cancel_beta = cr_param["cancel_beta"]
-        if rotary_amplitude is None:
-            rotary_amplitude = cr_param["rotary_amplitude"]
+        if cr_param is not None:
+            if cr_amplitude is None:
+                cr_amplitude = cr_param["cr_amplitude"]
+            if cr_duration is None:
+                cr_duration = cr_param["duration"]
+            if cr_ramptime is None:
+                cr_ramptime = cr_param["ramptime"]
+            if cr_phase is None:
+                cr_phase = cr_param["cr_phase"]
+            if cr_beta is None:
+                cr_beta = cr_param["cr_beta"]
+            if cancel_amplitude is None:
+                cancel_amplitude = cr_param["cancel_amplitude"]
+            if cancel_phase is None:
+                cancel_phase = cr_param["cancel_phase"]
+            if cancel_beta is None:
+                cancel_beta = cr_param["cancel_beta"]
+            if rotary_amplitude is None:
+                rotary_amplitude = cr_param["rotary_amplitude"]
+        if rotary_y is None:
+            rotary_y = 0.0 if cr_param is None else cr_param.get("rotary_y", 0.0)
+        if cr_detuning is None:
+            cr_detuning = 0.0 if cr_param is None else cr_param.get("cr_detuning", 0.0)
+        if control_frame_z is None:
+            control_frame_z = (
+                0.0 if cr_param is None else cr_param.get("control_frame_z", 0.0)
+            )
+        if target_frame_z is None:
+            target_frame_z = (
+                0.0 if cr_param is None else cr_param.get("target_frame_z", 0.0)
+            )
 
-        cancel_pulse = cancel_amplitude * np.exp(1j * cancel_phase) + rotary_amplitude
+        cr_duration = cast(float, cr_duration)
+        cr_ramptime = cast(float, cr_ramptime)
+        cr_amplitude = cast(float, cr_amplitude)
+        cr_phase = cast(float, cr_phase)
+        cr_beta = cast(float, cr_beta)
+        cancel_amplitude = cast(float, cancel_amplitude)
+        cancel_phase = cast(float, cancel_phase)
+        cancel_beta = cast(float, cancel_beta)
+        rotary_amplitude = cast(float, rotary_amplitude)
 
-        return CrossResonance(
+        cancel_pulse = (
+            cancel_amplitude * np.exp(1j * cancel_phase)
+            + rotary_amplitude
+            + 1j * rotary_y
+        )
+
+        schedule = CrossResonance(
             control_qubit=control_qubit,
             target_qubit=target_qubit,
             cr_amplitude=cr_amplitude,
@@ -604,6 +681,15 @@ class PulseService:
             echo=echo,
             pi_pulse=pi_pulse,
             pi_margin=x180_margin,
+            cr_detuning=cr_detuning,
+        )
+        return _append_local_z_corrections(
+            schedule,
+            control_qubit=control_qubit,
+            target_qubit=target_qubit,
+            cr_drive_label=cr_label,
+            control_frame_z=control_frame_z,
+            target_frame_z=target_frame_z,
         )
 
     def cnot(
@@ -776,10 +862,13 @@ class PulseService:
                 cancel_amplitude = cr_param["cancel_amplitude"]
                 cancel_phase = cr_param["cancel_phase"]
                 rotary_amplitude = cr_param["rotary_amplitude"]
+                rotary_y = cr_param.get("rotary_y", 0.0)
                 cancel_pulse = (
-                    cancel_amplitude * np.exp(1j * cancel_phase) + rotary_amplitude
+                    cancel_amplitude * np.exp(1j * cancel_phase)
+                    + rotary_amplitude
+                    + 1j * rotary_y
                 )
-                result[cr_label] = CrossResonance(
+                schedule = CrossResonance(
                     control_qubit=control_qubit,
                     target_qubit=target_qubit,
                     cr_amplitude=cr_param["cr_amplitude"],
@@ -793,6 +882,15 @@ class PulseService:
                     echo=True,
                     pi_pulse=self.x180(control_qubit),
                     pi_margin=0.0,
+                    cr_detuning=cr_param.get("cr_detuning", 0.0),
+                )
+                result[cr_label] = _append_local_z_corrections(
+                    schedule,
+                    control_qubit=control_qubit,
+                    target_qubit=target_qubit,
+                    cr_drive_label=cr_label,
+                    control_frame_z=cr_param.get("control_frame_z", 0.0),
+                    target_frame_z=cr_param.get("target_frame_z", 0.0),
                 )
 
         return result

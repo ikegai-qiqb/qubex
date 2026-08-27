@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import numpy as np
+
 from qxpulse.blank import Blank
+from qxpulse.phase_shift import PhaseShift
 from qxpulse.pulse_array import PulseArray
 from qxpulse.pulse_schedule import PulseSchedule
 from qxpulse.waveform import Waveform
@@ -31,6 +34,8 @@ class CrossResonance(PulseSchedule):
         The phase of the cross-resonance pulse in radians.
     cr_beta: float
         The DRAG correction coefficient for the cross-resonance pulse.
+    cr_detuning: float = 0.0
+        Frequency detuning in GHz applied only to the CR drive tone.
     cancel_amplitude: float = 0.0
         The amplitude of the cancel pulse.
     cancel_phase: float = 0.0
@@ -59,6 +64,7 @@ class CrossResonance(PulseSchedule):
         pi_pulse: Waveform | None = None,
         pi_margin: float | None = None,
         ramp_type: RampType = "RaisedCosine",
+        cr_detuning: float | None = None,
     ):
         cr_ramptime = cr_ramptime or 0.0
         cr_phase = cr_phase or 0.0
@@ -67,6 +73,7 @@ class CrossResonance(PulseSchedule):
         cancel_phase = cancel_phase or 0.0
         cancel_beta = cancel_beta or 0.0
         pi_margin = pi_margin or 0.0
+        cr_detuning = cr_detuning or 0.0
 
         cr_label = f"{control_qubit}-{target_qubit}"
 
@@ -77,6 +84,7 @@ class CrossResonance(PulseSchedule):
             phase=cr_phase,
             beta=cr_beta,
             type=ramp_type,
+            detuning=cr_detuning,
         )
 
         cancel_waveform = FlatTop(
@@ -98,6 +106,7 @@ class CrossResonance(PulseSchedule):
         self.cancel_amplitude = cancel_amplitude
         self.cancel_phase = cancel_phase
         self.cancel_beta = cancel_beta
+        self.cr_detuning = cr_detuning
         self.echo = echo
         self.pi_pulse = pi_pulse
         self.cr_label = cr_label
@@ -107,24 +116,48 @@ class CrossResonance(PulseSchedule):
         with PulseSchedule([cr_label, target_qubit]) as cr:
             cr.add(cr_label, cr_waveform)
             cr.add(target_qubit, cancel_waveform)
+        cr_lobe_duration = cr_waveform.cached_duration
 
         if not echo:
             super().__init__([cr_label, target_qubit])
             self.call(cr)
+            if cr_detuning != 0.0:
+                self.add(
+                    cr_label,
+                    PhaseShift(-2 * np.pi * cr_detuning * cr_lobe_duration),
+                )
         else:
             if pi_pulse is None:
                 raise ValueError("The pi pulse waveform must be provided.")
             if pi_margin > 0:
                 margin = Blank(duration=pi_margin)
                 pi_pulse = PulseArray([margin, pi_pulse, margin])
+            pi_duration = pi_pulse.cached_duration
+            second_lobe_start = cr_lobe_duration + pi_duration
+            detuning_phase_step = -2 * np.pi * cr_detuning * second_lobe_start
             with PulseSchedule([control_qubit, cr_label, target_qubit]) as ecr:
                 ecr.call(cr)
                 ecr.barrier()
                 ecr.add(control_qubit, pi_pulse)
                 ecr.barrier()
+                if cr_detuning != 0.0:
+                    # Waveform-local detuning restarts at each lobe, so carry
+                    # the accumulated CR-drive phase across the echo gap.
+                    ecr.add(
+                        cr_label,
+                        PhaseShift(detuning_phase_step),
+                    )
                 ecr.call(cr.scaled(-1))
                 ecr.barrier()
                 ecr.add(control_qubit, pi_pulse)
+                if cr_detuning != 0.0:
+                    ecr.barrier()
+                    # Preserve the detuned frame at the gate boundary so
+                    # nested or repeated ECR schedules remain phase-continuous.
+                    ecr.add(
+                        cr_label,
+                        PhaseShift(detuning_phase_step),
+                    )
 
             super().__init__([control_qubit, cr_label, target_qubit])
             self.call(ecr)

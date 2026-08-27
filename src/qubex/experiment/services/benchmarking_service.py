@@ -532,7 +532,10 @@ class BenchmarkingService:
             target
             for target in targets
             if self.ctx.experiment_system.get_target(target).is_cr
-            and target in self.ctx.calib_note.cr_params
+            and (
+                target in self.ctx.calib_note.cr_params
+                or (zx90 is not None and zx90.get(target) is not None)
+            )
         ]
 
         if n_cliffords_range is not None:
