@@ -109,6 +109,14 @@ from .experiment.spin_lock_spectroscopy import (
     spin_lock_sequence,
     spin_lock_spectroscopy,
 )
+from .experiment.srre_calibration import calibrate_srre
+from .experiment.srre_cr_calibration import calibrate_srre_zx90
+from .experiment.srre_cross_resonance import srre_rzx
+from .experiment.srre_waveform import (
+    calculate_srre_moments,
+    predict_srre_amplitude,
+    srre_waveform,
+)
 from .experiment.stark_characterization import (
     stark_ramsey_experiment,
     stark_t1_experiment,
@@ -123,10 +131,13 @@ from .experiment.thermal_excitation_characterization import (
 
 __all__ = [
     "analyze_chevron_matched_transform",
+    "calculate_srre_moments",
     "calibrate_cr_pi_pulse",
     "calibrate_gf_hpi_pulse",
     "calibrate_gf_pi_pulse",
     "calibrate_gf_pulse",
+    "calibrate_srre",
+    "calibrate_srre_zx90",
     "characterize_coarse_readout_parameters",
     "characterize_readout_parameters",
     "ckp_measurement_v2",
@@ -185,6 +196,7 @@ __all__ = [
     "pb_experiment_1q",
     "pb_experiment_2q",
     "plot_cpmg_results",
+    "predict_srre_amplitude",
     "purity_benchmarking",
     "purity_sequence_1q",
     "purity_sequence_2q",
@@ -197,6 +209,8 @@ __all__ = [
     "simultaneous_qubit_spectroscopy",
     "spin_lock_sequence",
     "spin_lock_spectroscopy",
+    "srre_rzx",
+    "srre_waveform",
     "stark_ramsey_experiment",
     "stark_t1_experiment",
     "sweep_readout_snr",
