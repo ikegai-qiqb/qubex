@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 from numpy.testing import assert_allclose
 
+import qubex.contrib.experiment.srre_cross_resonance as cross_resonance_module
 from qubex.contrib import srre_rzx
 from qubex.contrib.experiment.srre_cross_resonance import _build_srre_cross_resonance
 from qubex.experiment.services.pulse_service import PulseService
@@ -184,6 +185,30 @@ def test_internal_builder_supports_all_calibration_configurations(
             atol=1e-15,
         )
         assert exp.pulse.x180_calls == []
+
+
+def test_srre_off_builder_does_not_construct_an_unused_srre_waveform(
+    monkeypatch: pytest.MonkeyPatch,
+    calibration: dict[str, Any],
+) -> None:
+    """SRRE-off calibration gates should not generate a discarded waveform."""
+
+    def fail_if_called(**_kwargs: Any) -> None:
+        raise AssertionError("srre_waveform must not be called when SRRE is off")
+
+    monkeypatch.setattr(cross_resonance_module, "srre_waveform", fail_if_called)
+
+    schedule = _build_srre_cross_resonance(
+        cast(Any, _Experiment()),
+        CONTROL,
+        TARGET,
+        np.pi / 2,
+        calibration=calibration,
+        echo=False,
+        include_srre=False,
+    )
+
+    assert schedule.get_sampled_sequences()[TARGET].size == 2 * HALF_SAMPLES
 
 
 @pytest.mark.parametrize("angle", [0.0, -np.pi / 4, np.pi / 4])

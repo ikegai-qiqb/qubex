@@ -219,6 +219,7 @@ def calibrate_srre(
             amplitudes,
             analysis.differential_signal,
             analysis.fitted_signal,
+            root=analysis.root,
             title=f"SRRE amplitude calibration: {target}",
             xlabel="SRRE amplitude",
             ylabel="Differential signal",
@@ -379,17 +380,25 @@ def _plot_linear_fit(
     signal: NDArray[np.float64],
     fitted_signal: NDArray[np.float64],
     *,
+    root: float,
     title: str,
     xlabel: str,
     ylabel: str,
 ) -> None:
-    """Show measured zero-crossing data together with its fitted line."""
+    """Show measured zero-crossing data, its fitted line, and fitted root."""
     figure = make_figure()
     figure.add_trace(
         go.Scatter(x=x_values, y=signal, mode="markers", name="Measurement")
     )
     figure.add_trace(
         go.Scatter(x=x_values, y=fitted_signal, mode="lines", name="Linear fit")
+    )
+    figure.add_annotation(
+        x=root,
+        y=0.0,
+        text=f"root: {root:.6g}",
+        showarrow=True,
+        arrowhead=1,
     )
     figure.update_layout(title=title, xaxis_title=xlabel, yaxis_title=ylabel)
     figure.show()

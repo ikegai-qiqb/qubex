@@ -222,11 +222,14 @@ def _parse_calibration(calibration: Mapping[str, Any]) -> _SrreCrParameters:
 def _parse_srre_calibration(value: Any) -> _SrreParameters:
     if not isinstance(value, Mapping):
         raise TypeError("calibration['srre_calibration'] must be a mapping.")
+    amplitude = _as_positive_float(
+        _required(value, "amplitude"), name="srre_calibration.amplitude"
+    )
+    if amplitude > _HARDWARE_AMPLITUDE_LIMIT + _AMPLITUDE_TOLERANCE:
+        raise ValueError("SRRE absolute amplitude must not exceed 1.")
     return _SrreParameters(
         target=_as_label(_required(value, "target"), name="srre_calibration.target"),
-        amplitude=_as_positive_float(
-            _required(value, "amplitude"), name="srre_calibration.amplitude"
-        ),
+        amplitude=amplitude,
         block_duration=_as_positive_float(
             _required(value, "block_duration"),
             name="srre_calibration.block_duration",
@@ -308,20 +311,19 @@ def _build_half_schedule(
         beta=parameters.cancel_beta,
         sampling_period=sampling_period,
     )
-    rotary = srre_waveform(
-        block_duration=parameters.srre.block_duration,
-        ramp_time=parameters.srre.ramp_time,
-        amplitude=parameters.srre.amplitude,
-        sampling_period=sampling_period,
-    )
-
     cr_values = np.asarray(cr_waveform.values, dtype=np.complex128)
     target_values = np.asarray(cancellation_waveform.values, dtype=np.complex128).copy()
-    if rotary.length != target_values.size:
-        raise ValueError(
-            "SRRE block_duration must match cr_half_duration sample for sample."
-        )
     if include_srre:
+        rotary = srre_waveform(
+            block_duration=parameters.srre.block_duration,
+            ramp_time=parameters.srre.ramp_time,
+            amplitude=parameters.srre.amplitude,
+            sampling_period=sampling_period,
+        )
+        if rotary.length != target_values.size:
+            raise ValueError(
+                "SRRE block_duration must match cr_half_duration sample for sample."
+            )
         target_values += rotary.values
 
     _validate_channel_samples(cr_values, name="CR channel")

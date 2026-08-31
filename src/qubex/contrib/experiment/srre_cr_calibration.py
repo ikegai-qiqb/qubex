@@ -13,6 +13,7 @@ import numpy as np
 import plotly.graph_objects as go
 from numpy.typing import ArrayLike, NDArray
 
+from qubex.analysis import util
 from qubex.experiment import Experiment
 from qubex.experiment.experiment_constants import CALIBRATION_SHOTS
 from qubex.experiment.models.result import Result
@@ -35,7 +36,6 @@ _DEFAULT_CR_SWEEP_FACTORS = np.linspace(0.84, 1.16, 17)
 _DEFAULT_PHASE_OFFSETS = np.linspace(-0.16, 0.16, 17)
 _DEFAULT_CANCEL_SWEEP_POINTS = 17
 _DEFAULT_CANCEL_EDGE_ROTATION = 0.16
-_MAX_SWEEP_EXPANSION_FACTOR = 2.0
 _STAGE_CONFIGURATIONS: dict[_Stage, tuple[bool, bool]] = {
     "zx": (True, True),
     "zy": (True, False),
@@ -161,21 +161,23 @@ def calibrate_srre_zx90(
         Strictly increasing positive absolute CR amplitudes not exceeding one
         for stages 8 and 11. When omitted, 17 points spanning +/-16% around
         the ZX90 amplitude predicted for the fixed CR-half duration are used.
-        If the fitted root is outside the measured range, the sweep is extended
-        once toward it, up to twice the original distance from its center.
+        If the fitted root is outside the measured range, one equally wide
+        retry range with the same grid spacing is centered on the extrapolated
+        root. Previously measured points in the overlapping interval are reused.
     cr_phase_offsets : ArrayLike | None, optional
         Strictly increasing phase offsets in radians for stage 9a. Defaults to
         17 points spanning +/-0.16 rad. If the fitted root lies outside the
-        measured range, the sweep is extended once toward it, up to twice the
-        original half-span.
+        measured range, one retry range is centered on the extrapolated root;
+        its width and grid spacing match the first range, and overlapping data
+        are reused.
     cancel_y_offsets : ArrayLike | None, optional
         Strictly increasing cancellation-Y offsets for stage 9b. By default,
         target Rabi parameters set 17 symmetric points whose sweep edges rotate
         by `0.16 / N` rad in one candidate gate. An out-of-range root triggers
-        the same one-sided, at-most-twofold extension as the CR sweep.
+        the same root-centered retry as the CR sweep.
     cancel_x_offsets : ArrayLike | None, optional
         Strictly increasing cancellation-X offsets for stage 9c. Its default is
-        resolved and extended in the same way as `cancel_y_offsets`.
+        resolved and retried in the same way as `cancel_y_offsets`.
     error_amplification_n : int, optional
         Positive `N`; fine-stage sequences contain exactly `2N` cycles.
     fine_rounds : int, optional
@@ -200,7 +202,8 @@ def calibrate_srre_zx90(
         accepted. A failed result retains parameters accepted before the
         failure; the failing stage carries its reason. `requested_fine_rounds`
         and `completed_fine_rounds` report the requested and fully completed
-        counts.
+        counts. A completed result also contains the SRRE ZX90 coherence limit
+        when T1 and echo-T2 parameters are available.
 
     Raises
     ------
@@ -315,13 +318,12 @@ def calibrate_srre_zx90(
         accepted=accepted,
         stage="zx",
         sweep_values=amplitude_values,
-        root_reference=duration_resolution.predicted_cr_amplitude,
         error_amplification_n=error_amplification_n,
         scale_cancellation_with_cr=scale_cancellation_with_cr,
         n_shots=resolved_shots,
         shot_interval=resolved_interval,
         plot=plot,
-        allow_range_expansion=True,
+        allow_root_centered_retry=True,
     )
     accepted = initial_angle.accepted_calibration
 
@@ -360,6 +362,17 @@ def calibrate_srre_zx90(
         fine_rounds=round_results,
         requested_fine_rounds=fine_rounds,
         status=status,
+    )
+    result_data["coherence_limit"] = (
+        _report_completed_calibration(
+            exp,
+            control_qubit,
+            target_qubit,
+            calibration=result_data,
+            plot=plot,
+        )
+        if status == "completed"
+        else {}
     )
     return Result(data={"srre_cr_calibration": result_data})
 
@@ -774,58 +787,90 @@ def _measure_fitted_stage(
     calibration: Mapping[str, Any],
     stage: _Stage,
     sweep_values: ArrayLike,
-    root_reference: float,
     error_amplification_n: int,
     scale_cancellation_with_cr: bool,
     n_shots: int,
     shot_interval: float,
     plot: bool,
-    allow_range_expansion: bool,
+    allow_root_centered_retry: bool,
 ) -> tuple[_StageMeasurement, _ZeroCrossingAnalysis, list[dict[str, Any]]]:
-    """Measure and fit a stage, extending once toward an out-of-range root."""
-    values = _as_finite_vector(sweep_values, name="sweep_values")
-    if values.size < 2:
+    """Measure and fit a stage, retrying once around an extrapolated root."""
+    initial_values = _as_finite_vector(sweep_values, name="sweep_values")
+    if initial_values.size < 2:
         raise ValueError("sweep_values must contain at least two points.")
-    # Keep the local-refit window fixed if a second measurement extends one side.
+    # Keep the local-refit window fixed when a retry shifts the measured range.
     reference_sweep_span = _as_positive_float(
-        values[-1] - values[0],
+        initial_values[-1] - initial_values[0],
         name="reference_sweep_span",
     )
-    fit_history: list[dict[str, Any]] = []
-    for attempt in range(2):
-        measurement = _measure_stage(
+    initial_measurement = _measure_stage(
+        exp=exp,
+        control_qubit=control_qubit,
+        target_qubit=target_qubit,
+        calibration=calibration,
+        stage=stage,
+        sweep_values=initial_values,
+        error_amplification_n=error_amplification_n,
+        scale_cancellation_with_cr=scale_cancellation_with_cr,
+        n_shots=n_shots,
+        shot_interval=shot_interval,
+    )
+    initial_analysis = _fit_zero_crossing(
+        sweep_values=initial_measurement.sweep_values,
+        error_signal=initial_measurement.error_signal,
+        allow_outside=True,
+        reference_sweep_span=reference_sweep_span,
+    )
+    fit_history = [_fit_measurement_data(initial_measurement, initial_analysis)]
+    if plot:
+        _plot_stage_fit(initial_measurement, initial_analysis, stage=stage)
+    lower, upper = initial_analysis.root_bracket
+    if lower <= initial_analysis.root <= upper or not allow_root_centered_retry:
+        return initial_measurement, initial_analysis, fit_history
+
+    retry_grid = _root_centered_retry_grid(
+        initial_values,
+        root=initial_analysis.root,
+        bounds=(0.0, 1.0) if stage == "zx" else None,
+    )
+    # A root-centered grid need not align point-for-point with the first grid.
+    # Do not measure any candidate inside the first interval; the retry fit
+    # instead reuses the original samples that fall inside its new interval.
+    new_values = retry_grid[
+        (retry_grid < lower - _NUMERIC_TOLERANCE)
+        | (retry_grid > upper + _NUMERIC_TOLERANCE)
+    ]
+    additional_measurement = (
+        None
+        if new_values.size == 0
+        else _measure_stage(
             exp=exp,
             control_qubit=control_qubit,
             target_qubit=target_qubit,
             calibration=calibration,
             stage=stage,
-            sweep_values=values,
+            sweep_values=new_values,
             error_amplification_n=error_amplification_n,
             scale_cancellation_with_cr=scale_cancellation_with_cr,
             n_shots=n_shots,
             shot_interval=shot_interval,
         )
-        analysis = _fit_zero_crossing(
-            sweep_values=measurement.sweep_values,
-            error_signal=measurement.error_signal,
-            allow_outside=True,
-            reference_sweep_span=reference_sweep_span,
-        )
-        fit_history.append(_fit_measurement_data(measurement, analysis))
-        if plot:
-            _plot_stage_fit(measurement, analysis, stage=stage)
-        lower, upper = analysis.root_bracket
-        if lower <= analysis.root <= upper:
-            return measurement, analysis, fit_history
-        if not allow_range_expansion or attempt == 1:
-            return measurement, analysis, fit_history
-        values = _expand_sweep_toward_root(
-            values,
-            center=root_reference,
-            root=analysis.root,
-            bounds=(0.0, 1.0) if stage == "zx" else None,
-        )
-    raise RuntimeError("Unreachable fitted-stage state.")
+    )
+    retry_measurement = _assemble_retry_measurement(
+        initial_measurement,
+        additional_measurement,
+        retry_bounds=(float(retry_grid[0]), float(retry_grid[-1])),
+    )
+    retry_analysis = _fit_zero_crossing(
+        sweep_values=retry_measurement.sweep_values,
+        error_signal=retry_measurement.error_signal,
+        allow_outside=True,
+        reference_sweep_span=reference_sweep_span,
+    )
+    fit_history.append(_fit_measurement_data(retry_measurement, retry_analysis))
+    if plot:
+        _plot_stage_fit(retry_measurement, retry_analysis, stage=stage)
+    return retry_measurement, retry_analysis, fit_history
 
 
 def _run_parameter_stage(
@@ -836,13 +881,12 @@ def _run_parameter_stage(
     accepted: Mapping[str, Any],
     stage: _Stage,
     sweep_values: ArrayLike,
-    root_reference: float,
     error_amplification_n: int,
     scale_cancellation_with_cr: bool,
     n_shots: int,
     shot_interval: float,
     plot: bool,
-    allow_range_expansion: bool = False,
+    allow_root_centered_retry: bool = False,
 ) -> _StageRun:
     """Sweep one parameter and accept a valid fitted zero-crossing root."""
     current = _copy_calibration(accepted)
@@ -859,13 +903,12 @@ def _run_parameter_stage(
             calibration=current,
             stage=stage,
             sweep_values=sweep_values,
-            root_reference=root_reference,
             error_amplification_n=error_amplification_n,
             scale_cancellation_with_cr=scale_cancellation_with_cr,
             n_shots=n_shots,
             shot_interval=shot_interval,
             plot=plot,
-            allow_range_expansion=allow_range_expansion,
+            allow_root_centered_retry=allow_root_centered_retry,
         )
         _require_root_in_measured_range(analysis)
         proposed = _apply_stage_candidate(
@@ -936,13 +979,12 @@ def _run_fine_round(
             accepted=current,
             stage=stage,
             sweep_values=current_parameter + fine_offsets[stage],
-            root_reference=current_parameter,
             error_amplification_n=error_amplification_n,
             scale_cancellation_with_cr=scale_cancellation_with_cr,
             n_shots=n_shots,
             shot_interval=shot_interval,
             plot=plot,
-            allow_range_expansion=True,
+            allow_root_centered_retry=True,
         )
         round_data[data_key] = stage_run.data
         current = stage_run.accepted_calibration
@@ -966,13 +1008,12 @@ def _run_fine_round(
             cr_amplitude_range,
             center_amplitude=current_amplitude,
         ),
-        root_reference=current_amplitude,
         error_amplification_n=error_amplification_n,
         scale_cancellation_with_cr=scale_cancellation_with_cr,
         n_shots=n_shots,
         shot_interval=shot_interval,
         plot=plot,
-        allow_range_expansion=True,
+        allow_root_centered_retry=True,
     )
     round_data["final_angle_stage"] = final_angle.data
     current = final_angle.accepted_calibration
@@ -1245,56 +1286,79 @@ def _resolve_cr_amplitude_range(
     return result.copy()
 
 
-def _expand_sweep_toward_root(
+def _root_centered_retry_grid(
     values: NDArray[np.float64],
     *,
-    center: float,
     root: float,
     bounds: tuple[float, float] | None,
 ) -> NDArray[np.float64]:
-    """Extend one side of a sweep to twice its original distance from center."""
-    center = _as_finite_float(center, name="sweep center")
+    """Shift a sweep grid so its unchanged-width midpoint is the fitted root."""
+    values = _as_finite_vector(values, name="sweep_values")
     root = _as_finite_float(root, name="fitted root")
     if values.size < 2:
-        raise ValueError("A sweep must contain at least two points before expansion.")
-    differences = np.diff(values)
-    if np.any(differences <= 0.0):
-        raise ValueError("A sweep must be strictly increasing before expansion.")
-    step = float(np.min(differences))
-    lower = float(values[0])
-    upper = float(values[-1])
-    if root < lower:
-        span = center - lower
-        if span <= 0.0:
+        raise ValueError("A retry sweep requires at least two initial points.")
+    if np.any(np.diff(values) <= 0.0):
+        raise ValueError("The initial sweep must be strictly increasing.")
+    midpoint = (float(values[0]) + float(values[-1])) / 2.0
+    retry = values + (root - midpoint)
+    if bounds is not None:
+        lower_bound, upper_bound = bounds
+        if (
+            retry[0] <= lower_bound + _NUMERIC_TOLERANCE
+            or retry[-1] > upper_bound + _NUMERIC_TOLERANCE
+        ):
             raise ValueError(
-                "Cannot extend a sweep whose center is not above its lower end."
+                "The root-centered retry sweep exceeds the allowed parameter bounds."
             )
-        limit = center - _MAX_SWEEP_EXPANSION_FACTOR * span
-        if bounds is not None:
-            limit = max(limit, bounds[0])
-        extension = lower - limit
-        count = int(np.ceil(extension / step - _NUMERIC_TOLERANCE))
-        extra = np.linspace(limit, lower, count + 1, dtype=np.float64)[:-1]
-        expanded = np.concatenate((extra, values))
-    elif root > upper:
-        span = upper - center
-        if span <= 0.0:
+    return retry
+
+
+def _assemble_retry_measurement(
+    initial: _StageMeasurement,
+    additional: _StageMeasurement | None,
+    *,
+    retry_bounds: tuple[float, float],
+) -> _StageMeasurement:
+    """Combine reused overlap data with points measured outside the first range."""
+    lower, upper = retry_bounds
+    reuse_mask = (initial.sweep_values >= lower - _NUMERIC_TOLERANCE) & (
+        initial.sweep_values <= upper + _NUMERIC_TOLERANCE
+    )
+    value_parts = [initial.sweep_values[reuse_mask]]
+    state_parts = [initial.state_values[:, reuse_mask]]
+    signal_parts = [initial.error_signal[reuse_mask]]
+    diagnostic_keys = set(initial.diagnostic_signals)
+    raw_results = initial.raw_results
+    if additional is not None:
+        if set(additional.diagnostic_signals) != diagnostic_keys:
             raise ValueError(
-                "Cannot extend a sweep whose center is not below its upper end."
+                "Retry measurement diagnostics do not match the first sweep."
             )
-        limit = center + _MAX_SWEEP_EXPANSION_FACTOR * span
-        if bounds is not None:
-            limit = min(limit, bounds[1])
-        extension = limit - upper
-        count = int(np.ceil(extension / step - _NUMERIC_TOLERANCE))
-        extra = np.linspace(upper, limit, count + 1, dtype=np.float64)[1:]
-        expanded = np.concatenate((values, extra))
-    else:
-        return values.copy()
-    expanded = np.unique(expanded)
-    if expanded.size == values.size:
-        raise ValueError("The fitted root is outside the maximum sweep range.")
-    return expanded
+        value_parts.append(additional.sweep_values)
+        state_parts.append(additional.state_values)
+        signal_parts.append(additional.error_signal)
+        raw_results += additional.raw_results
+
+    combined_values = np.concatenate(value_parts)
+    if combined_values.size < 2:
+        raise ValueError("The root-centered retry range contains too few data points.")
+    order = np.argsort(combined_values)
+    diagnostics = {
+        key: np.concatenate(
+            [
+                initial.diagnostic_signals[key][reuse_mask],
+                *([] if additional is None else [additional.diagnostic_signals[key]]),
+            ]
+        )[order]
+        for key in diagnostic_keys
+    }
+    return _StageMeasurement(
+        sweep_values=combined_values[order],
+        state_values=np.concatenate(state_parts, axis=1)[:, order],
+        error_signal=np.concatenate(signal_parts)[order],
+        diagnostic_signals=diagnostics,
+        raw_results=raw_results,
+    )
 
 
 def _default_cancel_offsets(
@@ -1419,7 +1483,7 @@ def _plot_stage_fit(
     *,
     stage: _Stage,
 ) -> None:
-    """Show one CR calibration signal together with its fitted line."""
+    """Show one CR calibration signal, its fitted line, and fitted root."""
     figure = make_figure()
     figure.add_trace(
         go.Scatter(
@@ -1436,6 +1500,13 @@ def _plot_stage_fit(
             mode="lines",
             name="Linear fit",
         )
+    )
+    figure.add_annotation(
+        x=analysis.root,
+        y=0.0,
+        text=f"root: {analysis.root:.6g}",
+        showarrow=True,
+        arrowhead=1,
     )
     figure.update_layout(
         title=f"SRRE-CR {stage.upper()} calibration",
@@ -1557,6 +1628,141 @@ def _finalize_calibration_data(
         }
     )
     return result
+
+
+def _report_completed_calibration(
+    exp: Experiment,
+    control_qubit: str,
+    target_qubit: str,
+    *,
+    calibration: Mapping[str, Any],
+    plot: bool,
+) -> dict[str, float | str]:
+    """Print and optionally plot the final successful SRRE ZX90 calibration."""
+    zx90 = _build_srre_cross_resonance(
+        exp,
+        control_qubit,
+        target_qubit,
+        _REFERENCE_ANGLE,
+        calibration=calibration,
+        echo=True,
+        include_srre=True,
+    )
+    _print_calibrated_cr_parameters(calibration)
+    coherence_limit = _calculate_zx90_coherence_limit(
+        exp,
+        control_qubit,
+        target_qubit,
+        gate_time=_sampled_schedule_duration(zx90, calibration=calibration),
+    )
+    if coherence_limit:
+        _print_zx90_coherence_limit(coherence_limit)
+    if plot:
+        zx90.plot(
+            title=f"SRRE ZX90 sequence : {control_qubit}-{target_qubit}",
+            show_physical_pulse=True,
+        )
+    return coherence_limit
+
+
+def _sampled_schedule_duration(
+    schedule: PulseSchedule,
+    *,
+    calibration: Mapping[str, Any],
+) -> float:
+    """Return wall-clock duration from emitted samples and their sampling period."""
+    srre = calibration["srre_calibration"]
+    if not isinstance(srre, Mapping):
+        raise TypeError("calibration['srre_calibration'] must be a mapping.")
+    sampling_period = _as_positive_float(
+        _required(srre, "sampling_period", context="SRRE calibration"),
+        name="srre_calibration.sampling_period",
+    )
+    sampled = schedule.get_sampled_sequences()
+    sample_counts = {len(values) for values in sampled.values()}
+    if not sample_counts:
+        raise ValueError("The final SRRE ZX90 schedule must contain a pulse channel.")
+    if len(sample_counts) != 1:
+        raise ValueError("Final SRRE ZX90 channels must have the same sample count.")
+    sample_count = sample_counts.pop()
+    if sample_count == 0:
+        raise ValueError("The final SRRE ZX90 schedule must not be empty.")
+    return float(sample_count * sampling_period)
+
+
+def _print_calibrated_cr_parameters(calibration: Mapping[str, Any]) -> None:
+    """Print the accepted SRRE-assisted CR parameters."""
+    srre = calibration["srre_calibration"]
+    if not isinstance(srre, Mapping):
+        raise TypeError("calibration['srre_calibration'] must be a mapping.")
+
+    print()
+    print("Calibrated CR parameters:")
+    print(f"  CR duration      : {float(calibration['cr_half_duration']):.1f} ns")
+    print(f"  CR ramptime      : {float(calibration['cr_ramptime']):.1f} ns")
+    print(f"  CR amplitude     : {float(calibration['cr_amplitude']):.6f}")
+    print(f"  CR phase         : {float(calibration['cr_phase']):.6f}")
+    print(f"  CR beta          : {float(calibration['cr_beta']):.6f}")
+    print(f"  Cancel amplitude : {float(calibration['cancel_amplitude']):.6f}")
+    print(f"  Cancel phase     : {float(calibration['cancel_phase']):.6f}")
+    print(f"  Cancel beta      : {float(calibration['cancel_beta']):.6f}")
+    print(f"  SRRE amplitude   : {float(srre['amplitude']):.6f}")
+    print(f"  SRRE ramp time   : {float(srre['ramp_time']):.1f} ns")
+    print()
+
+
+def _calculate_zx90_coherence_limit(
+    exp: Experiment,
+    control_qubit: str,
+    target_qubit: str,
+    *,
+    gate_time: float,
+) -> dict[str, float | str]:
+    """Calculate the limit using the emitted SRRE ZX90 schedule duration."""
+    try:
+        config_loader = exp.ctx.system_manager.config_loader
+        t1_data = config_loader.load_param_data("t1")
+        t2_data = config_loader.load_param_data("t2_echo")
+        t1 = (
+            _as_positive_float(t1_data[control_qubit], name="control T1"),
+            _as_positive_float(t1_data[target_qubit], name="target T1"),
+        )
+        t2 = (
+            _as_positive_float(t2_data[control_qubit], name="control echo T2"),
+            _as_positive_float(t2_data[target_qubit], name="target echo T2"),
+        )
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return {}
+
+    duration = _as_positive_float(gate_time, name="SRRE ZX90 gate time")
+    return {
+        "control_qubit": control_qubit,
+        "target_qubit": target_qubit,
+        "gate_time": duration,
+        "t1_control": t1[0],
+        "t1_target": t1[1],
+        "t2_control": t2[0],
+        "t2_target": t2[1],
+        **util.calc_2q_gate_coherence_limit(
+            gate_time=duration,
+            t1=t1,
+            t2=t2,
+        ),
+    }
+
+
+def _print_zx90_coherence_limit(
+    coherence_limit: Mapping[str, float | str],
+) -> None:
+    """Print an SRRE ZX90 coherence-limit estimate."""
+    print("ZX90 coherence limit:")
+    print(f"  Gate time       : {float(coherence_limit['gate_time']):.0f} ns")
+    print(f"  T1 (control)    : {float(coherence_limit['t1_control']) * 1e-3:.1f} μs")
+    print(f"  T1 (target)     : {float(coherence_limit['t1_target']) * 1e-3:.1f} μs")
+    print(f"  T2 (control)    : {float(coherence_limit['t2_control']) * 1e-3:.1f} μs")
+    print(f"  T2 (target)     : {float(coherence_limit['t2_target']) * 1e-3:.1f} μs")
+    print(f"  Coherence limit : {float(coherence_limit['fidelity']) * 100:.2f} %")
+    print()
 
 
 def _as_four_state_values(values: ArrayLike) -> NDArray[np.float64]:

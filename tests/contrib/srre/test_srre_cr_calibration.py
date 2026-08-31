@@ -16,13 +16,15 @@ from qubex.contrib.experiment.srre_cr_calibration import (
     _build_stage_sequence,
     _calculate_ix_signal,
     _calculate_iy_signal,
+    _calculate_zx90_coherence_limit,
     _calculate_zx_signals,
     _calculate_zy_signal,
     _default_cancel_offsets,
-    _expand_sweep_toward_root,
     _fit_zero_crossing,
     _measure_stage,
+    _report_completed_calibration,
     _resolve_cr_half_duration,
+    _root_centered_retry_grid,
     _run_parameter_stage,
 )
 from qubex.experiment.models.result import Result
@@ -295,43 +297,34 @@ def test_default_cancel_offsets_use_target_rabi_rate_and_requested_rotation() ->
     assert exp.pulse.validated_targets == [[TARGET]]
 
 
-@pytest.mark.parametrize(
-    ("root", "expected_edge"),
-    [(0.62, 0.66), (0.38, 0.34)],
-)
-def test_sweep_expansion_extends_only_toward_root_up_to_twice_the_span(
+@pytest.mark.parametrize("root", [0.62, 0.38])
+def test_retry_sweep_preserves_grid_and_centers_on_extrapolated_root(
     root: float,
-    expected_edge: float,
 ) -> None:
-    """Range expansion should preserve the other edge and double one half-span."""
+    """A retry should shift, rather than enlarge, the original sweep grid."""
     values = 0.5 * np.linspace(0.84, 1.16, 17)
 
-    expanded = _expand_sweep_toward_root(
+    retry = _root_centered_retry_grid(
         values,
-        center=0.5,
         root=root,
         bounds=(0.0, 1.0),
     )
 
-    if root > values[-1]:
-        assert expanded[0] == pytest.approx(values[0], abs=1e-15)
-        assert expanded[-1] == pytest.approx(expected_edge, abs=1e-15)
-    else:
-        assert expanded[0] == pytest.approx(expected_edge, abs=1e-15)
-        assert expanded[-1] == pytest.approx(values[-1], abs=1e-15)
+    assert (retry[0] + retry[-1]) / 2 == pytest.approx(root, abs=1e-15)
+    assert retry[-1] - retry[0] == pytest.approx(values[-1] - values[0], abs=1e-15)
+    assert_allclose(np.diff(retry), np.diff(values), rtol=0.0, atol=1e-15)
 
 
-def test_sweep_expansion_does_not_overshoot_a_nonuniform_range_limit() -> None:
-    """A custom sweep should stop exactly at its doubled directional span."""
-    expanded = _expand_sweep_toward_root(
-        np.array([0.4, 0.44, 0.5]),
-        center=0.5,
+def test_retry_sweep_preserves_a_nonuniform_custom_grid() -> None:
+    """A shifted custom sweep should retain every original adjacent interval."""
+    values = np.array([0.4, 0.44, 0.5])
+    retry = _root_centered_retry_grid(
+        values,
         root=0.25,
         bounds=(0.0, 1.0),
     )
 
-    assert expanded[0] == pytest.approx(0.3, abs=1e-15)
-    assert expanded[-1] == pytest.approx(0.5, abs=1e-15)
+    assert_allclose(retry, [0.2, 0.24, 0.3], rtol=0.0, atol=1e-15)
 
 
 def test_explicit_duration_centers_default_cr_sweep_on_predicted_zx90_amplitude(
@@ -736,7 +729,6 @@ def test_valid_root_is_accepted_without_fresh_verification(
         accepted=accepted,
         stage="zx",
         sweep_values=[0.3, 0.5],
-        root_reference=0.3,
         error_amplification_n=1,
         scale_cancellation_with_cr=True,
         n_shots=128,
@@ -783,7 +775,6 @@ def test_zx_stage_rejects_a_nonpositive_root(
         accepted=accepted,
         stage="zx",
         sweep_values=[0.0, 0.1],
-        root_reference=0.05,
         error_amplification_n=1,
         scale_cancellation_with_cr=True,
         n_shots=128,
@@ -797,10 +788,16 @@ def test_zx_stage_rejects_a_nonpositive_root(
     assert stage.accepted_calibration["cr_amplitude"] == pytest.approx(0.3)
 
 
-def test_cancel_stage_remeasures_once_after_directional_range_expansion(
+@pytest.mark.parametrize(
+    ("stage_name", "parameter"),
+    [("iy", "cancel_y"), ("ix", "cancel_x")],
+)
+def test_cancel_stage_retries_around_root_without_remeasuring_overlap(
     monkeypatch: pytest.MonkeyPatch,
+    stage_name: str,
+    parameter: str,
 ) -> None:
-    """An out-of-range cancel root should trigger one expanded measured sweep."""
+    """A retry should measure only centered-grid points outside the first range."""
     measured_ranges: list[np.ndarray] = []
 
     def fake_measure_stage(**kwargs: Any) -> Any:
@@ -820,45 +817,44 @@ def test_cancel_stage_remeasures_once_after_directional_range_expansion(
         accepted={
             "cr_amplitude": 0.3,
             "cr_phase": 0.2,
-            "cancel_x": 0.1,
+            "cancel_x": 0.0,
             "cancel_y": 0.0,
         },
-        stage="iy",
+        stage=cast(Any, stage_name),
         sweep_values=[-0.1, 0.0, 0.1],
-        root_reference=0.0,
         error_amplification_n=1,
         scale_cancellation_with_cr=True,
         n_shots=128,
         shot_interval=1024.0,
         plot=False,
-        allow_range_expansion=True,
+        allow_root_centered_retry=True,
     )
 
     assert len(measured_ranges) == 2
     assert_allclose(measured_ranges[0], [-0.1, 0.0, 0.1], atol=1e-15)
-    assert_allclose(measured_ranges[1], [-0.1, 0.0, 0.1, 0.2], atol=1e-15)
+    assert_allclose(measured_ranges[1], [0.15, 0.25], atol=1e-15)
+    assert_allclose(
+        stage.data["fit_history"][1]["sweep_values"],
+        [0.1, 0.15, 0.25],
+        atol=1e-15,
+    )
     assert stage.data["root"] == pytest.approx(0.15, abs=1e-15)
-    assert stage.accepted_calibration["cancel_y"] == pytest.approx(0.15, abs=1e-15)
+    assert stage.accepted_calibration[parameter] == pytest.approx(0.15, abs=1e-15)
 
 
-def test_cr_stage_expands_its_single_17_point_sweep(
+def test_cr_stage_retries_on_same_width_grid_without_remeasuring_overlap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """CR amplitude should expand its only fit without a separate fine sweep."""
+    """CR retry points should lie outside the first sweep's overlapping part."""
     measured_ranges: list[np.ndarray] = []
-    fitted_roots = iter((0.62, 0.64))
-    last_root = 0.5
 
     def fake_measure_stage(**kwargs: Any) -> Any:
-        nonlocal last_root
         values = np.asarray(kwargs["sweep_values"], dtype=float)
         measured_ranges.append(values)
-        if values.size > 2:
-            last_root = next(fitted_roots)
         return _mock_stage_measurement(
             sweep_values=values,
             stage=kwargs["stage"],
-            root=last_root,
+            root=0.62,
         )
 
     monkeypatch.setattr(calibration_module, "_measure_stage", fake_measure_stage)
@@ -874,32 +870,35 @@ def test_cr_stage_expands_its_single_17_point_sweep(
         },
         stage="zx",
         sweep_values=0.5 * np.linspace(0.84, 1.16, 17),
-        root_reference=0.5,
         error_amplification_n=1,
         scale_cancellation_with_cr=True,
         n_shots=128,
         shot_interval=1024.0,
         plot=False,
-        allow_range_expansion=True,
+        allow_root_centered_retry=True,
     )
 
-    assert [values.size for values in measured_ranges] == [17, 25]
-    assert measured_ranges[1][-1] == pytest.approx(0.66, abs=1e-15)
-    assert stage.data["root"] == pytest.approx(0.64, abs=1e-15)
-    assert stage.accepted_calibration["cr_amplitude"] == pytest.approx(0.64, abs=1e-15)
+    assert [values.size for values in measured_ranges] == [17, 12]
+    assert measured_ranges[1][0] == pytest.approx(0.59, abs=1e-15)
+    assert measured_ranges[1][-1] == pytest.approx(0.70, abs=1e-15)
+    retry_fit_values = stage.data["fit_history"][1]["sweep_values"]
+    assert retry_fit_values[0] == pytest.approx(0.54, abs=1e-15)
+    assert retry_fit_values[-1] == pytest.approx(0.70, abs=1e-15)
+    assert stage.data["root"] == pytest.approx(0.62, abs=1e-15)
+    assert stage.accepted_calibration["cr_amplitude"] == pytest.approx(0.62, abs=1e-15)
 
 
 @pytest.mark.parametrize(
     ("root", "expected_lower", "expected_upper"),
-    [(0.37, 0.04, 0.52), (0.03, -0.12, 0.36)],
+    [(0.37, 0.37, 0.53), (0.03, -0.13, 0.03)],
 )
-def test_phase_stage_remeasures_once_after_directional_range_expansion(
+def test_phase_stage_retries_around_root_without_remeasuring_overlap(
     monkeypatch: pytest.MonkeyPatch,
     root: float,
     expected_lower: float,
     expected_upper: float,
 ) -> None:
-    """CR phase should expand one side up to twice the default half-span."""
+    """CR phase should retry outside the overlap on a root-centered grid."""
     measured_ranges: list[np.ndarray] = []
 
     def fake_measure_stage(**kwargs: Any) -> Any:
@@ -924,13 +923,12 @@ def test_phase_stage_remeasures_once_after_directional_range_expansion(
         },
         stage="zy",
         sweep_values=0.2 + np.linspace(-0.16, 0.16, 17),
-        root_reference=0.2,
         error_amplification_n=1,
         scale_cancellation_with_cr=True,
         n_shots=128,
         shot_interval=1024.0,
         plot=False,
-        allow_range_expansion=True,
+        allow_root_centered_retry=True,
     )
 
     assert len(measured_ranges) == 2
@@ -947,14 +945,14 @@ def test_phase_stage_remeasures_once_after_directional_range_expansion(
     assert len(stage.data["fit_history"]) == 2
 
 
-@pytest.mark.parametrize(("root", "expected_edge"), [(0.37, 0.52), (0.03, -0.12)])
-def test_public_workflow_expands_default_phase_sweep_toward_root(
+@pytest.mark.parametrize(("root", "expected_edge"), [(0.37, 0.53), (0.03, -0.13)])
+def test_public_workflow_centers_phase_retry_on_extrapolated_root(
     monkeypatch: pytest.MonkeyPatch,
     srre_calibration: dict[str, Any],
     root: float,
     expected_edge: float,
 ) -> None:
-    """The default phase sweep should retry once toward an out-of-range root."""
+    """The default phase retry should reuse overlap and center on the first root."""
     fitted_roots: dict[str, float] = {}
     phase_fit_ranges: list[np.ndarray] = []
 
@@ -1032,7 +1030,6 @@ def test_stage_plot_contains_measurements_and_linear_fit(
         },
         stage="zy",
         sweep_values=[0.0, 0.1, 0.2],
-        root_reference=0.2,
         error_amplification_n=1,
         scale_cancellation_with_cr=True,
         n_shots=128,
@@ -1043,9 +1040,103 @@ def test_stage_plot_contains_measurements_and_linear_fit(
     assert stage.data["status"] == "accepted"
     assert len(shown_figures) == 1
     assert [trace.mode for trace in shown_figures[0].data] == ["markers", "lines"]
+    assert len(shown_figures[0].layout.annotations) == 1
+    annotation = shown_figures[0].layout.annotations[0]
+    assert annotation.x == pytest.approx(0.1, abs=1e-15)
+    assert annotation.y == pytest.approx(0.0, abs=1e-15)
+    assert annotation.text == "root: 0.1"
+    assert annotation.showarrow is True
     assert shown_figures[0].layout.yaxis.title.text == "S_ZY"
     assert shown_figures[0].layout.template.layout.width == 600
     assert shown_figures[0].layout.template.layout.height == 300
+
+
+def test_completed_calibration_prints_summary_coherence_and_plots_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    srre_calibration: dict[str, Any],
+) -> None:
+    """The final report should match the standard ZX90 calibration summary."""
+    plot_calls: list[dict[str, Any]] = []
+    zx90 = SimpleNamespace(
+        get_sampled_sequences=lambda: {TARGET: np.zeros(512)},
+        plot=lambda **kwargs: plot_calls.append(kwargs),
+    )
+    monkeypatch.setattr(
+        calibration_module,
+        "_build_srre_cross_resonance",
+        lambda *_args, **_kwargs: zx90,
+    )
+    exp = _Experiment()
+    exp.ctx.system_manager = SimpleNamespace(
+        config_loader=SimpleNamespace(
+            load_param_data=lambda name: {
+                "t1": {CONTROL: 100_000.0, TARGET: 120_000.0},
+                "t2_echo": {CONTROL: 80_000.0, TARGET: 90_000.0},
+            }[name]
+        )
+    )
+    calibration = {
+        "cr_half_duration": 192.0,
+        "cr_ramptime": 16.0,
+        "cr_amplitude": 0.42,
+        "cr_phase": 0.1,
+        "cr_beta": 0.01,
+        "cancel_amplitude": 0.08,
+        "cancel_phase": -0.2,
+        "cancel_beta": -0.02,
+        "srre_calibration": srre_calibration,
+    }
+
+    coherence_limit = _report_completed_calibration(
+        cast(Any, exp),
+        CONTROL,
+        TARGET,
+        calibration=calibration,
+        plot=True,
+    )
+
+    output = capsys.readouterr().out
+    assert "Calibrated CR parameters:" in output
+    assert "CR amplitude     : 0.420000" in output
+    assert "SRRE amplitude   : 0.300000" in output
+    assert "ZX90 coherence limit:" in output
+    assert "Gate time       : 512 ns" in output
+    assert "Coherence limit :" in output
+    assert coherence_limit["gate_time"] == pytest.approx(512.0)
+    assert 0.0 < float(coherence_limit["fidelity"]) < 1.0
+    assert plot_calls == [
+        {
+            "title": f"SRRE ZX90 sequence : {CONTROL}-{TARGET}",
+            "show_physical_pulse": True,
+        }
+    ]
+
+
+@pytest.mark.parametrize("invalid_t1", [0.0, np.nan, "invalid"])
+def test_invalid_optional_coherence_data_does_not_discard_calibration(
+    invalid_t1: Any,
+) -> None:
+    """Malformed optional T1/T2 data should suppress only the final estimate."""
+    exp = _Experiment()
+    exp.ctx.system_manager = SimpleNamespace(
+        config_loader=SimpleNamespace(
+            load_param_data=lambda name: {
+                "t1": {CONTROL: invalid_t1, TARGET: 120_000.0},
+                "t2_echo": {CONTROL: 80_000.0, TARGET: 90_000.0},
+            }[name]
+        )
+    )
+
+    assert (
+        _calculate_zx90_coherence_limit(
+            cast(Any, exp),
+            CONTROL,
+            TARGET,
+            gate_time=512.0,
+        )
+        == {}
+    )
 
 
 def test_calibrate_srre_zx90_orchestrates_all_stages_and_returns_contract(
@@ -1117,6 +1208,7 @@ def test_calibrate_srre_zx90_orchestrates_all_stages_and_returns_contract(
     assert calibration["srre_calibration"]["amplitude"] == 0.3
     assert calibration["requested_fine_rounds"] == 1
     assert calibration["completed_fine_rounds"] == 1
+    assert calibration["coherence_limit"] == {}
     assert len(calibration["fine_rounds"]) == 1
     assert "final_verification" not in calibration
     assert "converged" not in calibration

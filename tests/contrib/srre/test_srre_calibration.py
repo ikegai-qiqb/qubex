@@ -515,6 +515,12 @@ def test_calibrate_srre_plots_differential_signal_and_fit(
 
     assert len(shown) == 1
     assert [trace.name for trace in shown[0].data] == ["Measurement", "Linear fit"]
+    assert len(shown[0].layout.annotations) == 1
+    annotation = shown[0].layout.annotations[0]
+    assert annotation.x == pytest.approx(0.52, abs=1e-12)
+    assert annotation.y == pytest.approx(0.0, abs=1e-15)
+    assert annotation.text == "root: 0.52"
+    assert annotation.showarrow is True
     assert shown[0].layout.xaxis.title.text == "SRRE amplitude"
     assert shown[0].layout.yaxis.title.text == "Differential signal"
     assert shown[0].layout.template.layout.width == 600
