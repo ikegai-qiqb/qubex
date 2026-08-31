@@ -329,6 +329,22 @@ def test_builder_rejects_identical_control_and_target_qubits(
         )
 
 
+def test_builder_rejects_a_failed_calibration_result(
+    calibration: dict[str, Any],
+) -> None:
+    """A partial calibration must not silently become a production gate."""
+    calibration["status"] = "failed"
+
+    with pytest.raises(ValueError, match="status must be 'completed'"):
+        srre_rzx(
+            cast(Any, _Experiment()),
+            CONTROL,
+            TARGET,
+            np.pi / 2,
+            calibration=calibration,
+        )
+
+
 def test_builder_resolves_missing_measurement_sampling_period(
     calibration: dict[str, Any],
 ) -> None:

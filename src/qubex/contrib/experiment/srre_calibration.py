@@ -13,7 +13,7 @@ from qubex.experiment import Experiment
 from qubex.experiment.experiment_constants import CALIBRATION_SHOTS
 from qubex.experiment.models.result import Result
 from qubex.measurement.measurement_defaults import resolve_measurement_defaults
-from qubex.pulse import Arbitrary, PulseSchedule, Waveform
+from qubex.pulse import Arbitrary, PulseArray, PulseSchedule, Waveform
 from qubex.visualization import make_figure
 
 from .srre_waveform import predict_srre_amplitude, srre_waveform
@@ -71,8 +71,9 @@ def calibrate_srre(
     ramp_time : float
         Ramp-up and ramp-down duration of each lobe in ns.
     amplitude_range : ArrayLike | None, optional
-        Strictly increasing candidate peak amplitudes. Defaults to 17 points
-        spanning ±8% around the predicted root, clipped to `amplitude_bounds`.
+        Strictly increasing candidate peak amplitudes. Defaults to up to 17
+        distinct points spanning ±8% around the predicted root, clipped to
+        `amplitude_bounds`.
     amplitude_bounds : tuple[float, float], optional
         Non-negative hardware amplitude bounds used for root prediction.
     probe_detuning : float | None, optional
@@ -92,7 +93,9 @@ def calibrate_srre(
     Returns
     -------
     Result
-        Result containing the `srre_calibration` data contract.
+        Result whose `data["srre_calibration"]` contains the accepted and
+        predicted amplitudes, waveform geometry, probe settings, fitted line,
+        measured differential signals, and the raw sweep result.
 
     Raises
     ------
@@ -129,13 +132,13 @@ def calibrate_srre(
 
     exp.pulse.validate_rabi_params([target])
 
-    rabi_rate_per_amplitude = _as_positive_float(
-        exp.pulse.calc_rabi_rate(target, 1.0),
+    def rabi_rate_from_amplitude(amplitude: float) -> float:
+        return exp.pulse.calc_rabi_rate(target, amplitude)
+
+    _as_positive_float(
+        rabi_rate_from_amplitude(1.0),
         name="Rabi rate at unit amplitude",
     )
-
-    def rabi_rate_from_amplitude(amplitude: float) -> float:
-        return amplitude * rabi_rate_per_amplitude
 
     prediction = predict_srre_amplitude(
         block_duration=block_duration,
@@ -144,6 +147,11 @@ def calibrate_srre(
         amplitude_bounds=amplitude_bounds,
         sampling_period=sampling_period,
     )
+    # The predictor has validated both durations against the sampling grid.
+    # Canonicalize them so sequence timing and returned metadata describe the
+    # waveform that is actually emitted, not harmless input roundoff.
+    block_duration = float(round(block_duration / sampling_period) * sampling_period)
+    ramp_time = float(round(ramp_time / sampling_period) * sampling_period)
     amplitudes = _resolve_amplitude_range(
         amplitude_range,
         predicted_amplitude=prediction.amplitude,
@@ -215,9 +223,10 @@ def calibrate_srre(
             xlabel="SRRE amplitude",
             ylabel="Differential signal",
         )
-    calibrated_rabi_rate = rabi_rate_from_amplitude(analysis.root)
-    if not np.isfinite(calibrated_rabi_rate):
-        raise ValueError("The calibrated amplitude must map to a finite Rabi rate.")
+    calibrated_rabi_rate = _as_positive_float(
+        rabi_rate_from_amplitude(analysis.root),
+        name="Rabi rate at the calibrated amplitude",
+    )
 
     return Result(
         data={
@@ -517,29 +526,45 @@ def _validate_reference_pulse(
 ) -> None:
     if not isinstance(pulse, Waveform):
         raise TypeError(f"{name} must be a Waveform.")
-    if not np.isclose(
-        pulse.sampling_period,
-        sampling_period,
-        rtol=0.0,
-        atol=_SAMPLING_PERIOD_TOLERANCE,
-    ):
-        raise ValueError(
-            f"{name} sampling period ({pulse.sampling_period} ns) must match "
-            f"the SRRE sampling period ({sampling_period} ns)."
-        )
+    waveforms = _flatten_waveforms(pulse, name=name)
+    for waveform in waveforms:
+        if not np.isclose(
+            waveform.sampling_period,
+            sampling_period,
+            rtol=0.0,
+            atol=_SAMPLING_PERIOD_TOLERANCE,
+        ):
+            raise ValueError(
+                f"{name} sampling period ({waveform.sampling_period} ns) must match "
+                f"the SRRE sampling period ({sampling_period} ns)."
+            )
     _validate_waveform_peak(pulse, name=name)
 
 
 def _validate_waveform_peak(pulse: Waveform, *, name: str) -> None:
-    values = np.asarray(pulse.values, dtype=np.complex128)
-    if values.size == 0:
-        raise ValueError(f"{name} must contain at least one sample.")
-    if not np.all(np.isfinite(values)):
-        raise ValueError(f"{name} must contain only finite samples.")
-    if np.max(np.abs(values)) > (
-        _HARDWARE_AMPLITUDE_LIMIT + _HARDWARE_AMPLITUDE_TOLERANCE
-    ):
-        raise ValueError(f"{name} amplitude must not exceed the hardware limit of 1.")
+    for waveform in _flatten_waveforms(pulse, name=name):
+        values = np.asarray(waveform.values, dtype=np.complex128)
+        if values.size == 0:
+            raise ValueError(f"{name} must contain at least one sample.")
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"{name} must contain only finite samples.")
+        if np.max(np.abs(values)) > (
+            _HARDWARE_AMPLITUDE_LIMIT + _HARDWARE_AMPLITUDE_TOLERANCE
+        ):
+            raise ValueError(
+                f"{name} amplitude must not exceed the hardware limit of 1."
+            )
+
+
+def _flatten_waveforms(pulse: Waveform, *, name: str) -> list[Waveform]:
+    waveforms = (
+        pulse.get_flattened_waveforms(apply_frame_shifts=False)
+        if isinstance(pulse, PulseArray)
+        else [pulse]
+    )
+    if not waveforms:
+        raise ValueError(f"{name} must contain at least one waveform.")
+    return waveforms
 
 
 def _wrap_to_small_angle(angle: float) -> float:

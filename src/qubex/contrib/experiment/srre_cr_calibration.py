@@ -6,6 +6,7 @@ import math
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import asdict, dataclass
+from numbers import Real
 from typing import Any, Literal
 
 import numpy as np
@@ -30,7 +31,6 @@ _REFERENCE_ANGLE = np.pi / 2.0
 _DURATION_UNIT = 16.0
 _NUMERIC_TOLERANCE = 1e-12
 _MIN_ABSOLUTE_SLOPE = 1e-9
-_SIGNAL_TOLERANCE = 0.02
 _DEFAULT_CR_SWEEP_FACTORS = np.linspace(0.84, 1.16, 17)
 _DEFAULT_PHASE_OFFSETS = np.linspace(-0.16, 0.16, 17)
 _DEFAULT_CANCEL_SWEEP_POINTS = 17
@@ -102,9 +102,7 @@ class _StageRun:
 class _FineRoundRun:
     data: dict[str, Any]
     accepted_calibration: dict[str, Any]
-    final_verification: dict[str, Any] | None
     failed: bool
-    converged: bool
 
 
 def calibrate_srre_zx90(
@@ -122,10 +120,9 @@ def calibrate_srre_zx90(
     cancel_y_offsets: ArrayLike | None = None,
     cancel_x_offsets: ArrayLike | None = None,
     error_amplification_n: int = 1,
-    max_fine_rounds: int = 2,
+    fine_rounds: int = 1,
     scale_cancellation_with_cr: bool = True,
     n_shots: int | None = None,
-    verification_n_shots: int | None = None,
     shot_interval: float | None = None,
     plot: bool = True,
 ) -> Result:
@@ -135,9 +132,9 @@ def calibrate_srre_zx90(
     The workflow consumes CR parameters previously produced by
     `obtain_cr_params`, fixes one CR-half/SRRE geometry, calibrates or reuses the
     one-qubit SRRE amplitude, and performs the documented ZX, ZY, IY, and IX
-    four-state zero-crossing stages. Every proposed parameter is remeasured at
-    a fresh verification point before it is accepted. Each zero-crossing fit
-    is repeated using only points within half the original sweep span of its
+    four-state zero-crossing stages. A valid zero-crossing root is accepted
+    without an additional verification measurement. Each zero-crossing fit is
+    repeated using only points within half the original sweep span of its
     preliminary root when that leaves at least two points.
 
     Parameters
@@ -164,6 +161,8 @@ def calibrate_srre_zx90(
         Strictly increasing positive absolute CR amplitudes not exceeding one
         for stages 8 and 11. When omitted, 17 points spanning +/-16% around
         the ZX90 amplitude predicted for the fixed CR-half duration are used.
+        If the fitted root is outside the measured range, the sweep is extended
+        once toward it, up to twice the original distance from its center.
     cr_phase_offsets : ArrayLike | None, optional
         Strictly increasing phase offsets in radians for stage 9a. Defaults to
         17 points spanning +/-0.16 rad. If the fitted root lies outside the
@@ -172,20 +171,20 @@ def calibrate_srre_zx90(
     cancel_y_offsets : ArrayLike | None, optional
         Strictly increasing cancellation-Y offsets for stage 9b. By default,
         target Rabi parameters set 17 symmetric points whose sweep edges rotate
-        by `0.16 / N` rad in one candidate gate.
+        by `0.16 / N` rad in one candidate gate. An out-of-range root triggers
+        the same one-sided, at-most-twofold extension as the CR sweep.
     cancel_x_offsets : ArrayLike | None, optional
         Strictly increasing cancellation-X offsets for stage 9c. Its default is
-        resolved in the same way as `cancel_y_offsets`.
+        resolved and extended in the same way as `cancel_y_offsets`.
     error_amplification_n : int, optional
         Positive `N`; fine-stage sequences contain exactly `2N` cycles.
-    max_fine_rounds : int, optional
-        Positive maximum number of phase/cancellation/final-angle rounds.
+    fine_rounds : int, optional
+        Positive number of phase/cancellation/final-angle rounds to run. The
+        default is one. Each round runs ZY, IY, IX, then ZX in that order.
     scale_cancellation_with_cr : bool, optional
         Whether accepted cancellation IQ scales with CR amplitude candidates.
     n_shots : int | None, optional
         Shots per four-state sweep point. Defaults to calibration shots.
-    verification_n_shots : int | None, optional
-        Shots per fresh verification point. Defaults to `n_shots`.
     shot_interval : float | None, optional
         Shot interval in ns. Defaults to the current experiment context.
     plot : bool, optional
@@ -195,7 +194,13 @@ def calibrate_srre_zx90(
     Returns
     -------
     Result
-        Result containing the complete `srre_cr_calibration` data contract.
+        Result whose `data["srre_cr_calibration"]` contains the last accepted
+        parameters and all stage data. `status` is `"completed"` after every
+        requested round succeeds and `"failed"` when a root cannot be safely
+        accepted. A failed result retains parameters accepted before the
+        failure; the failing stage carries its reason. `requested_fine_rounds`
+        and `completed_fine_rounds` report the requested and fully completed
+        counts.
 
     Raises
     ------
@@ -209,7 +214,9 @@ def calibrate_srre_zx90(
     -----
     This function performs hardware measurements but does not run
     `obtain_cr_params`, update the calibration note, or mutate reused
-    calibration mappings.
+    calibration mappings. Fit or measurement failures are represented by a
+    returned `status="failed"`; invalid inputs detected before calibration are
+    raised as exceptions.
     """
     _validate_label(control_qubit, name="control_qubit")
     _validate_label(target_qubit, name="target_qubit")
@@ -218,7 +225,7 @@ def calibrate_srre_zx90(
     error_amplification_n = _as_positive_integer(
         error_amplification_n, name="error_amplification_n"
     )
-    max_fine_rounds = _as_positive_integer(max_fine_rounds, name="max_fine_rounds")
+    fine_rounds = _as_positive_integer(fine_rounds, name="fine_rounds")
     if not isinstance(scale_cancellation_with_cr, (bool, np.bool_)):
         raise TypeError("scale_cancellation_with_cr must be a boolean.")
     if not isinstance(plot, (bool, np.bool_)):
@@ -229,11 +236,6 @@ def calibrate_srre_zx90(
         n_shots,
         default=CALIBRATION_SHOTS,
         name="n_shots",
-    )
-    resolved_verification_shots = _resolve_optional_positive_integer(
-        verification_n_shots,
-        default=resolved_shots,
-        name="verification_n_shots",
     )
     resolved_interval = _resolve_optional_positive_float(
         shot_interval,
@@ -317,25 +319,17 @@ def calibrate_srre_zx90(
         error_amplification_n=error_amplification_n,
         scale_cancellation_with_cr=scale_cancellation_with_cr,
         n_shots=resolved_shots,
-        verification_n_shots=resolved_verification_shots,
         shot_interval=resolved_interval,
         plot=plot,
         allow_range_expansion=True,
     )
     accepted = initial_angle.accepted_calibration
 
-    fine_rounds: list[dict[str, Any]] = []
-    final_verification: dict[str, Any] = _verification_summary(
-        initial_angle.data,
-        None,
-        None,
-        None,
-    )
+    round_results: list[dict[str, Any]] = []
     failed = initial_angle.data["status"] == "failed"
-    converged = False
 
     if not failed:
-        for round_index in range(max_fine_rounds):
+        for round_index in range(fine_rounds):
             fine_round = _run_fine_round(
                 exp,
                 control_qubit,
@@ -347,34 +341,24 @@ def calibrate_srre_zx90(
                 error_amplification_n=error_amplification_n,
                 scale_cancellation_with_cr=scale_cancellation_with_cr,
                 n_shots=resolved_shots,
-                verification_n_shots=resolved_verification_shots,
                 shot_interval=resolved_interval,
                 plot=plot,
             )
             accepted = fine_round.accepted_calibration
-            fine_rounds.append(fine_round.data)
+            round_results.append(fine_round.data)
             failed = fine_round.failed
-            converged = fine_round.converged
-            if fine_round.final_verification is not None:
-                final_verification = fine_round.final_verification
-            if failed or converged:
+            if failed:
                 break
 
-    if failed:
-        status = "failed"
-    elif converged:
-        status = "converged"
-    else:
-        status = "max_fine_rounds_reached"
+    status = "failed" if failed else "completed"
 
     result_data = _finalize_calibration_data(
         accepted,
         duration_resolution=duration_resolution,
         srre_stage=srre_stage,
         initial_angle_stage=initial_angle.data,
-        fine_rounds=fine_rounds,
-        final_verification=final_verification,
-        converged=converged,
+        fine_rounds=round_results,
+        requested_fine_rounds=fine_rounds,
         status=status,
     )
     return Result(data={"srre_cr_calibration": result_data})
@@ -856,14 +840,12 @@ def _run_parameter_stage(
     error_amplification_n: int,
     scale_cancellation_with_cr: bool,
     n_shots: int,
-    verification_n_shots: int,
     shot_interval: float,
     plot: bool,
     allow_range_expansion: bool = False,
 ) -> _StageRun:
-    """Sweep, propose, freshly verify, and conditionally accept one parameter."""
+    """Sweep one parameter and accept a valid fitted zero-crossing root."""
     current = _copy_calibration(accepted)
-    current_parameter = _stage_parameter_value(current, stage=stage)
     input_params = _parameter_snapshot(current)
     configuration = _configuration_data(stage)
     measurement: _StageMeasurement | None = None
@@ -905,88 +887,6 @@ def _run_parameter_stage(
             accepted_calibration=current,
         )
 
-    verification_values = _verification_sweep_values(
-        current_parameter=current_parameter,
-        candidate_parameter=analysis.root,
-    )
-    verification: _StageMeasurement | None = None
-    try:
-        verification = _measure_stage(
-            exp=exp,
-            control_qubit=control_qubit,
-            target_qubit=target_qubit,
-            calibration=current,
-            stage=stage,
-            sweep_values=verification_values,
-            error_amplification_n=error_amplification_n,
-            scale_cancellation_with_cr=scale_cancellation_with_cr,
-            n_shots=verification_n_shots,
-            shot_interval=shot_interval,
-        )
-        candidate_index = _matching_index(
-            verification.sweep_values,
-            analysis.root,
-            name="candidate root",
-        )
-        candidate_signal = float(verification.error_signal[candidate_index])
-        if verification.sweep_values.size == 1:
-            current_signal = candidate_signal
-        else:
-            current_index = _matching_index(
-                verification.sweep_values,
-                current_parameter,
-                name="current parameter",
-            )
-            current_signal = float(verification.error_signal[current_index])
-    except (KeyError, RuntimeError, TypeError, ValueError) as exc:
-        return _failed_verification_run(
-            current=current,
-            proposed=proposed,
-            measurement=measurement,
-            analysis=analysis,
-            configuration=configuration,
-            reason=str(exc),
-            current_parameter=current_parameter,
-            verification=verification,
-            fit_history=fit_history,
-        )
-
-    same_parameter = np.isclose(
-        analysis.root,
-        current_parameter,
-        rtol=0.0,
-        atol=_NUMERIC_TOLERANCE,
-    )
-    improved = abs(candidate_signal) + _NUMERIC_TOLERANCE < abs(current_signal)
-    verified = improved or (
-        same_parameter and abs(candidate_signal) <= _SIGNAL_TOLERANCE
-    )
-    if not verified:
-        return _failed_verification_run(
-            current=current,
-            proposed=proposed,
-            measurement=measurement,
-            analysis=analysis,
-            configuration=configuration,
-            reason="Fresh verification did not improve the calibration signal.",
-            verification=verification,
-            current_parameter=current_parameter,
-            current_signal=current_signal,
-            candidate_signal=candidate_signal,
-            fit_history=fit_history,
-        )
-
-    converged = abs(candidate_signal) <= _SIGNAL_TOLERANCE
-    verification_data = {
-        **_stage_measurement_data(verification),
-        "current_parameter": current_parameter,
-        "candidate_parameter": analysis.root,
-        "current_signal": current_signal,
-        "candidate_signal": candidate_signal,
-        "improved": improved,
-        "status": "accepted",
-        "reason": None,
-    }
     return _StageRun(
         data={
             **_stage_measurement_data(measurement),
@@ -1000,9 +900,7 @@ def _run_parameter_stage(
             "fitted_signal": analysis.fitted_signal.copy(),
             "fit_history": fit_history,
             "fit_quality": _fit_quality(analysis),
-            "verification": verification_data,
             "configuration": configuration,
-            "converged": converged,
             "status": "accepted",
             "reason": None,
         },
@@ -1022,7 +920,6 @@ def _run_fine_round(
     error_amplification_n: int,
     scale_cancellation_with_cr: bool,
     n_shots: int,
-    verification_n_shots: int,
     shot_interval: float,
     plot: bool,
 ) -> _FineRoundRun:
@@ -1043,7 +940,6 @@ def _run_fine_round(
             error_amplification_n=error_amplification_n,
             scale_cancellation_with_cr=scale_cancellation_with_cr,
             n_shots=n_shots,
-            verification_n_shots=verification_n_shots,
             shot_interval=shot_interval,
             plot=plot,
             allow_range_expansion=True,
@@ -1052,13 +948,11 @@ def _run_fine_round(
         current = stage_run.accepted_calibration
         if stage_run.data["status"] == "failed":
             _fill_skipped_stages(round_data, after=data_key)
-            round_data["converged"] = False
+            round_data["status"] = "failed"
             return _FineRoundRun(
                 data=round_data,
                 accepted_calibration=current,
-                final_verification=None,
                 failed=True,
-                converged=False,
             )
 
     current_amplitude = _stage_parameter_value(current, stage="zx")
@@ -1076,7 +970,6 @@ def _run_fine_round(
         error_amplification_n=error_amplification_n,
         scale_cancellation_with_cr=scale_cancellation_with_cr,
         n_shots=n_shots,
-        verification_n_shots=verification_n_shots,
         shot_interval=shot_interval,
         plot=plot,
         allow_range_expansion=True,
@@ -1084,30 +977,18 @@ def _run_fine_round(
     round_data["final_angle_stage"] = final_angle.data
     current = final_angle.accepted_calibration
     if final_angle.data["status"] == "failed":
-        round_data["converged"] = False
+        round_data["status"] = "failed"
         return _FineRoundRun(
             data=round_data,
             accepted_calibration=current,
-            final_verification=None,
             failed=True,
-            converged=False,
         )
 
-    verification = _verification_summary(
-        final_angle.data,
-        round_data["phase_stage"],
-        round_data["cancel_y_stage"],
-        round_data["cancel_x_stage"],
-    )
-    converged = bool(verification["converged"])
-    round_data["verification"] = verification
-    round_data["converged"] = converged
+    round_data["status"] = "completed"
     return _FineRoundRun(
         data=round_data,
         accepted_calibration=current,
-        final_verification=verification,
         failed=False,
-        converged=converged,
     )
 
 
@@ -1295,7 +1176,10 @@ def _apply_stage_candidate(
     candidate: float,
     scale_cancellation_with_cr: bool,
 ) -> dict[str, Any]:
-    result = _copy_calibration(calibration)
+    # Candidate application only replaces top-level scalar parameters. Keep
+    # nested SRRE metadata and raw results shared instead of deep-copying them
+    # for every sequence in every sweep.
+    result = dict(calibration)
     value = _as_finite_float(candidate, name="candidate")
     if stage == "zx":
         current_amplitude = _as_positive_float(
@@ -1597,67 +1481,10 @@ def _failed_stage_data(
         "fitted_signal": (None if analysis is None else analysis.fitted_signal.copy()),
         "fit_history": [] if fit_history is None else fit_history,
         "fit_quality": None if analysis is None else _fit_quality(analysis),
-        "verification": None,
         "configuration": dict(configuration),
-        "converged": False,
         "status": "failed",
         "reason": reason,
     }
-
-
-def _failed_verification_run(
-    *,
-    current: Mapping[str, Any],
-    proposed: Mapping[str, Any],
-    measurement: _StageMeasurement,
-    analysis: _ZeroCrossingAnalysis,
-    configuration: Mapping[str, bool],
-    reason: str,
-    current_parameter: float,
-    verification: _StageMeasurement | None = None,
-    current_signal: float | None = None,
-    candidate_signal: float | None = None,
-    fit_history: list[dict[str, Any]] | None = None,
-) -> _StageRun:
-    verification_data: dict[str, Any] = (
-        {"status": "failed", "reason": reason}
-        if verification is None
-        else {
-            **_stage_measurement_data(verification),
-            "status": "failed",
-            "reason": reason,
-        }
-    )
-    verification_data.update(
-        {
-            "current_parameter": current_parameter,
-            "candidate_parameter": analysis.root,
-            "current_signal": current_signal,
-            "candidate_signal": candidate_signal,
-            "improved": False,
-        }
-    )
-    return _StageRun(
-        data={
-            **_stage_measurement_data(measurement),
-            "input_params": _parameter_snapshot(current),
-            "proposed_params": _parameter_snapshot(proposed),
-            "accepted_params": _parameter_snapshot(current),
-            "root": analysis.root,
-            "root_bracket": analysis.root_bracket,
-            "fit_slope": analysis.fit_slope,
-            "fit_intercept": analysis.fit_intercept,
-            "fitted_signal": analysis.fitted_signal.copy(),
-            "fit_history": [] if fit_history is None else fit_history,
-            "fit_quality": _fit_quality(analysis),
-            "verification": verification_data,
-            "configuration": dict(configuration),
-            "converged": False,
-            "status": "failed",
-            "reason": reason,
-        },
-        accepted_calibration=_copy_calibration(current),
-    )
 
 
 def _fit_quality(analysis: _ZeroCrossingAnalysis) -> dict[str, float]:
@@ -1665,32 +1492,6 @@ def _fit_quality(analysis: _ZeroCrossingAnalysis) -> dict[str, float]:
         "absolute_slope": abs(analysis.fit_slope),
         "bracket_width": analysis.root_bracket[1] - analysis.root_bracket[0],
     }
-
-
-def _matching_index(values: NDArray[np.float64], target: float, *, name: str) -> int:
-    indices = np.flatnonzero(
-        np.isclose(values, target, rtol=0.0, atol=_NUMERIC_TOLERANCE)
-    )
-    if indices.size != 1:
-        raise ValueError(f"Fresh verification is missing the {name} point.")
-    return int(indices[0])
-
-
-def _verification_sweep_values(
-    *,
-    current_parameter: float,
-    candidate_parameter: float,
-) -> NDArray[np.float64]:
-    if np.isclose(
-        current_parameter,
-        candidate_parameter,
-        rtol=0.0,
-        atol=_NUMERIC_TOLERANCE,
-    ):
-        return np.asarray([current_parameter], dtype=np.float64)
-    return np.sort(
-        np.asarray([current_parameter, candidate_parameter], dtype=np.float64)
-    )
 
 
 def _parameter_snapshot(calibration: Mapping[str, Any]) -> dict[str, float]:
@@ -1704,78 +1505,6 @@ def _parameter_snapshot(calibration: Mapping[str, Any]) -> dict[str, float]:
 
 def _copy_calibration(calibration: Mapping[str, Any]) -> dict[str, Any]:
     return deepcopy(dict(calibration))
-
-
-def _verification_summary(
-    angle_stage: Mapping[str, Any],
-    phase_stage: Mapping[str, Any] | None,
-    cancel_y_stage: Mapping[str, Any] | None,
-    cancel_x_stage: Mapping[str, Any] | None,
-) -> dict[str, Any]:
-    stage_map = {
-        "s_zx": angle_stage,
-        "s_zy": phase_stage,
-        "s_iy": cancel_y_stage,
-        "s_ix": cancel_x_stage,
-    }
-    signals: dict[str, float | None] = {}
-    checks: dict[str, bool] = {}
-    for name, stage in stage_map.items():
-        signal = _accepted_verification_signal(stage)
-        signals[name] = signal
-        checks[name] = signal is not None and abs(signal) <= _SIGNAL_TOLERANCE
-    diagnostics = angle_stage.get("verification")
-    ix_from_z: float | None = None
-    ix_from_z_current: float | None = None
-    ix_from_z_not_worse = False
-    if isinstance(diagnostics, Mapping):
-        diagnostic_signals = diagnostics.get("diagnostic_signals")
-        candidate = diagnostics.get("candidate_parameter")
-        current = diagnostics.get("current_parameter")
-        sweep_values = diagnostics.get("sweep_values")
-        if (
-            isinstance(diagnostic_signals, Mapping)
-            and "ix_from_z" in diagnostic_signals
-            and candidate is not None
-            and current is not None
-            and sweep_values is not None
-        ):
-            values = np.asarray(sweep_values, dtype=np.float64)
-            candidate_index = _matching_index(
-                values, float(candidate), name="candidate root"
-            )
-            current_index = _matching_index(
-                values, float(current), name="current parameter"
-            )
-            ix_diagnostic = np.asarray(diagnostic_signals["ix_from_z"])
-            ix_from_z = float(ix_diagnostic[candidate_index])
-            ix_from_z_current = float(ix_diagnostic[current_index])
-            ix_from_z_not_worse = (
-                abs(ix_from_z)
-                <= abs(ix_from_z_current) + _SIGNAL_TOLERANCE + _NUMERIC_TOLERANCE
-            )
-    signals["s_ix_from_z"] = ix_from_z
-    signals["s_ix_from_z_current"] = ix_from_z_current
-    checks["s_ix_from_z_not_worse"] = ix_from_z_not_worse
-    complete = all(stage is not None for stage in stage_map.values())
-    return {
-        "signals": signals,
-        "checks": checks,
-        "signal_tolerance": _SIGNAL_TOLERANCE,
-        "converged": complete and all(checks.values()),
-    }
-
-
-def _accepted_verification_signal(stage: Mapping[str, Any] | None) -> float | None:
-    if stage is None:
-        return None
-    verification = stage.get("verification")
-    if not isinstance(verification, Mapping):
-        return None
-    value = verification.get("candidate_signal")
-    if value is None:
-        return None
-    return float(value)
 
 
 def _fill_skipped_stages(round_data: dict[str, Any], *, after: str) -> None:
@@ -1794,9 +1523,7 @@ def _fill_skipped_stages(round_data: dict[str, Any], *, after: str) -> None:
             "fitted_signal": None,
             "fit_history": [],
             "fit_quality": None,
-            "verification": None,
             "configuration": None,
-            "converged": False,
             "status": "skipped",
             "reason": f"Skipped after {after} failed.",
         }
@@ -1809,8 +1536,7 @@ def _finalize_calibration_data(
     srre_stage: Mapping[str, Any],
     initial_angle_stage: Mapping[str, Any],
     fine_rounds: list[dict[str, Any]],
-    final_verification: Mapping[str, Any],
-    converged: bool,
+    requested_fine_rounds: int,
     status: str,
 ) -> dict[str, Any]:
     result = _copy_calibration(accepted)
@@ -1823,9 +1549,10 @@ def _finalize_calibration_data(
             "srre_stage": dict(srre_stage),
             "initial_angle_stage": dict(initial_angle_stage),
             "fine_rounds": fine_rounds,
-            "fine_round_count": len(fine_rounds),
-            "final_verification": dict(final_verification),
-            "converged": converged,
+            "requested_fine_rounds": requested_fine_rounds,
+            "completed_fine_rounds": sum(
+                round_data.get("status") == "completed" for round_data in fine_rounds
+            ),
             "status": status,
         }
     )
@@ -1870,12 +1597,9 @@ def _validate_label(value: Any, *, name: str) -> None:
 
 
 def _as_finite_float(value: Any, *, name: str) -> float:
-    if isinstance(value, (bool, np.bool_)):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
         raise TypeError(f"{name} must be a real number.")
-    try:
-        result = float(value)
-    except (TypeError, ValueError) as exc:
-        raise TypeError(f"{name} must be a real number.") from exc
+    result = float(value)
     if not np.isfinite(result):
         raise ValueError(f"{name} must be finite.")
     return result

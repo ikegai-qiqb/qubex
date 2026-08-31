@@ -16,7 +16,7 @@ from qubex.contrib.experiment.srre_calibration import (
     _build_srre_calibration_sequence,
 )
 from qubex.experiment.models.result import Result
-from qubex.pulse import Arbitrary, PulseSchedule
+from qubex.pulse import Arbitrary, PulseArray, PulseSchedule
 
 
 class _PulseService:
@@ -243,6 +243,30 @@ def test_sequence_rejects_reference_pulses_on_a_different_sampling_grid() -> Non
         )
 
 
+def test_sequence_validates_every_nested_reference_waveform_sampling_grid() -> None:
+    """A PulseArray must not hide a nested waveform on a different grid."""
+    pulse = _PulseService(sampling_period=2.0)
+    pulse.y90 = lambda _target: PulseArray(  # type: ignore[method-assign]
+        [
+            Arbitrary([0.25j], sampling_period=1.0),
+            Arbitrary([0.25j], sampling_period=2.0),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="sampling period"):
+        _build_srre_calibration_sequence(
+            cast(Any, SimpleNamespace(pulse=pulse)),
+            "Q00",
+            block_duration=200.0,
+            ramp_time=0.0,
+            amplitude=0.5,
+            detuning=0.001,
+            repetitions=1,
+            analysis_angle=np.pi / 2,
+            sampling_period=2.0,
+        )
+
+
 def test_sequence_rejects_a_non_waveform_reference_pulse() -> None:
     """Calibration references should fail clearly when a pulse service is invalid."""
     pulse = _PulseService()
@@ -391,6 +415,22 @@ def test_calibrate_srre_uses_new_defaults_and_context_interval() -> None:
     assert exp.measurement_service.calls[0]["shot_interval"] == pytest.approx(4096.0)
 
 
+def test_calibrate_srre_returns_realized_sampling_grid_geometry() -> None:
+    """Returned timing metadata should omit accepted floating-point grid noise."""
+    result = calibrate_srre(
+        cast(Any, _Experiment(root=0.52)),
+        "Q00",
+        block_duration=200.0 + 5e-10,
+        ramp_time=0.0,
+        plot=False,
+    )
+
+    calibration = cast(dict[str, Any], result.data["srre_calibration"])
+    assert calibration["block_duration"] == 200.0
+    assert calibration["ramp_time"] == 0.0
+    assert calibration["probe_detuning"] == pytest.approx(1.0 / 3200.0)
+
+
 @pytest.mark.parametrize(
     ("unit_rabi_rate", "message"),
     [
@@ -402,10 +442,16 @@ def test_calibrate_srre_uses_new_defaults_and_context_interval() -> None:
 def test_calibrate_srre_rejects_invalid_unit_amplitude_rabi_rate(
     unit_rabi_rate: float,
     message: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Root prediction requires a finite positive Rabi rate at unit amplitude."""
     exp = _Experiment()
-    exp.pulse.calc_rabi_rate = lambda _target, _amplitude: unit_rabi_rate
+
+    def mock_calc_rabi_rate(_target: str, amplitude: float) -> float:
+        del _target, amplitude
+        return unit_rabi_rate
+
+    monkeypatch.setattr(exp.pulse, "calc_rabi_rate", mock_calc_rabi_rate)
 
     with pytest.raises(ValueError, match=message):
         calibrate_srre(
@@ -415,6 +461,37 @@ def test_calibrate_srre_rejects_invalid_unit_amplitude_rabi_rate(
             ramp_time=0.0,
             plot=False,
         )
+
+
+def test_calibrate_srre_uses_the_pulse_services_full_rabi_relation() -> None:
+    """Prediction and calibrated metadata should preserve a nonlinear Rabi model."""
+    nonlinear_root = float(
+        next(root.real for root in np.roots([1.0, 0.0, 1.0, -1.0]) if root.real > 0)
+    )
+    exp = _Experiment(root=nonlinear_root)
+    exp.pulse.calc_rabi_rate = lambda _target, amplitude: (
+        0.01 * amplitude + 0.01 * amplitude**3
+    )
+
+    result = calibrate_srre(
+        cast(Any, exp),
+        "Q00",
+        block_duration=200.0,
+        ramp_time=0.0,
+        amplitude_range=[
+            nonlinear_root - 0.02,
+            nonlinear_root,
+            nonlinear_root + 0.02,
+        ],
+        plot=False,
+    )
+
+    calibration = cast(dict[str, Any], result.data["srre_calibration"])
+    assert calibration["predicted_amplitude"] == pytest.approx(
+        nonlinear_root, abs=1e-10
+    )
+    assert calibration["amplitude"] == pytest.approx(nonlinear_root, abs=1e-12)
+    assert calibration["rabi_rate"] == pytest.approx(0.01, abs=1e-12)
 
 
 def test_calibrate_srre_plots_differential_signal_and_fit(

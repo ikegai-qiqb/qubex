@@ -143,6 +143,30 @@ def test_calculate_srre_moments_preserves_symmetry_and_lobe_area() -> None:
     assert np.isfinite(moments.f0.imag)
 
 
+def test_moments_use_the_realized_sampling_grid_duration() -> None:
+    """Accepted duration roundoff must not spoil discrete SRRE symmetry."""
+    exact = calculate_srre_moments(
+        block_duration=8.0,
+        ramp_time=1.0,
+        amplitude=0.5,
+        rabi_rate_from_amplitude=_linear_rabi_rate,
+        sampling_period=1.0,
+    )
+    rounded = calculate_srre_moments(
+        block_duration=8.0 + 5e-10,
+        ramp_time=1.0,
+        amplitude=0.5,
+        rabi_rate_from_amplitude=_linear_rabi_rate,
+        sampling_period=1.0,
+    )
+
+    assert rounded.f0 == pytest.approx(exact.f0, abs=1e-15)
+    assert rounded.f1 == pytest.approx(exact.f1, abs=1e-15)
+    assert rounded.positive_lobe_angle == pytest.approx(
+        exact.positive_lobe_angle, abs=1e-15
+    )
+
+
 def test_negative_lobe_moments_remain_finite_and_symmetric() -> None:
     """Negative SRRE angles should keep both moments finite and F1 near zero."""
     moments = calculate_srre_moments(
@@ -253,6 +277,18 @@ def test_calculate_srre_moments_rejects_overflowing_rotation_angles() -> None:
             ramp_time=1.0,
             amplitude=0.5,
             rabi_rate_from_amplitude=lambda _amplitude: float(np.finfo(np.float64).max),
+            sampling_period=1.0,
+        )
+
+
+def test_calculate_srre_moments_rejects_overflowing_cumulative_rotation() -> None:
+    """Finite per-sample angles must not turn into NaN moments after accumulation."""
+    with pytest.raises(ValueError, match="Cumulative SRRE rotation angles"):
+        calculate_srre_moments(
+            block_duration=8.0,
+            ramp_time=0.0,
+            amplitude=1.0,
+            rabi_rate_from_amplitude=lambda amplitude: 1e307 * amplitude,
             sampling_period=1.0,
         )
 

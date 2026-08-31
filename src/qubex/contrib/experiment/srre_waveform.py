@@ -71,7 +71,7 @@ class SrrePrediction:
     f1 : complex
         Centered first modulation moment at the predicted root.
     root_bracket : tuple[float, float]
-        Scan interval containing the predicted root.
+        Numerical scan interval containing the predicted root.
     """
 
     amplitude: float
@@ -238,7 +238,7 @@ def predict_srre_amplitude(
     -------
     SrrePrediction
         Predicted amplitude, peak Rabi rate, moments, geometric phase, and the
-        measured numerical bracket used by the solver.
+        numerical scan bracket used by the solver.
 
     Raises
     ------
@@ -325,7 +325,7 @@ def _validate_geometry(
     if lobe_samples < 2 * ramp_samples:
         raise ValueError("lobe duration must be at least twice ramp_time.")
     return _SrreGeometry(
-        block_duration=block_duration,
+        block_duration=float(block_samples * sampling_period),
         sampling_period=sampling_period,
         lobe_samples=lobe_samples,
         ramp_samples=ramp_samples,
@@ -388,7 +388,10 @@ def _calculate_moments(
         block_duration=block_duration,
         sampling_period=sampling_period,
     )
-    positive_lobe_angle = float(np.sum(angle_steps[:lobe_samples]))
+    with np.errstate(over="ignore", invalid="ignore"):
+        positive_lobe_angle = float(np.sum(angle_steps[:lobe_samples]))
+    if not np.isfinite(positive_lobe_angle):
+        raise ValueError("The accumulated positive-lobe rotation must be finite.")
     return SrreMoments(
         f0=f0,
         f1=f1,
@@ -403,7 +406,10 @@ def _integrate_modulation(
     sampling_period: float,
 ) -> tuple[complex, complex]:
     """Integrate `exp(i * theta)` exactly over constant-rate AWG samples."""
-    theta_starts = np.cumsum(angle_steps) - angle_steps
+    with np.errstate(over="ignore", invalid="ignore"):
+        theta_starts = np.cumsum(angle_steps) - angle_steps
+    if not np.all(np.isfinite(theta_starts)):
+        raise ValueError("Cumulative SRRE rotation angles must be finite.")
     phase_starts = np.exp(1j * theta_starts)
     half_angles = angle_steps / 2
     centered_phases = np.exp(1j * half_angles)
@@ -431,6 +437,8 @@ def _integrate_modulation(
     )
     f0 = complex(np.sum(modulation_integrals) / block_duration)
     f1 = complex(np.sum(centered_modulation_integrals) / block_duration**2)
+    if not np.all(np.isfinite([f0.real, f0.imag, f1.real, f1.imag])):
+        raise ValueError("Integrated SRRE moments must be finite.")
     return f0, f1
 
 

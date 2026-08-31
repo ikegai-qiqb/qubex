@@ -24,7 +24,6 @@ from qubex.contrib.experiment.srre_cr_calibration import (
     _measure_stage,
     _resolve_cr_half_duration,
     _run_parameter_stage,
-    _verification_summary,
 )
 from qubex.experiment.models.result import Result
 from qubex.pulse import Arbitrary, PulseSchedule
@@ -408,7 +407,6 @@ def test_default_sweeps_and_context_interval_are_used_in_the_public_workflow(
         cr_half_duration=192.0,
         srre_ramp_time=20.0,
         srre_calibration=srre_calibration,
-        max_fine_rounds=1,
         plot=False,
     )
 
@@ -441,7 +439,9 @@ def test_default_sweeps_and_context_interval_are_used_in_the_public_workflow(
     )
     assert all(call["shot_interval"] == pytest.approx(4096.0) for call in calls)
     calibration = cast(dict[str, Any], result.data["srre_cr_calibration"])
-    assert calibration["status"] == "converged"
+    assert calibration["requested_fine_rounds"] == 1
+    assert calibration["completed_fine_rounds"] == 1
+    assert calibration["status"] == "completed"
 
 
 @pytest.mark.parametrize(
@@ -690,12 +690,9 @@ def _mock_stage_measurement(
     sweep_values: Any,
     stage: str,
     root: float,
-    candidate_signal: float = 0.0,
 ) -> Any:
     values = np.asarray(sweep_values, dtype=float)
     error_signal = values - root
-    if values.size <= 2 and candidate_signal != 0.0:
-        error_signal = np.array([0.1, candidate_signal])
     diagnostics = {"ix_from_z": np.zeros(values.size)} if stage == "zx" else {}
     return SimpleNamespace(
         sweep_values=values,
@@ -706,24 +703,20 @@ def _mock_stage_measurement(
     )
 
 
-def test_verification_rejects_a_distinct_candidate_that_worsens_the_signal(
+def test_valid_root_is_accepted_without_fresh_verification(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A worse candidate should be rejected even when it is inside tolerance."""
+    """A valid fitted root should be accepted without another measurement."""
     measurement_count = 0
 
     def fake_measure_stage(**kwargs: Any) -> Any:
         nonlocal measurement_count
         measurement_count += 1
         values = np.asarray(kwargs["sweep_values"], dtype=float)
-        if measurement_count == 1:
-            error_signal = np.array([-0.1, 0.1])
-        else:
-            error_signal = np.array([0.001, 0.01])
         return SimpleNamespace(
             sweep_values=values,
             state_values=np.zeros((4, values.size)),
-            error_signal=error_signal,
+            error_signal=np.array([-0.1, 0.1]),
             diagnostic_signals={"ix_from_z": np.zeros(values.size)},
             raw_results=(),
         )
@@ -747,14 +740,14 @@ def test_verification_rejects_a_distinct_candidate_that_worsens_the_signal(
         error_amplification_n=1,
         scale_cancellation_with_cr=True,
         n_shots=128,
-        verification_n_shots=256,
         shot_interval=1024.0,
         plot=False,
     )
 
-    assert stage.data["status"] == "failed"
-    assert "did not improve" in stage.data["reason"]
-    assert stage.accepted_calibration["cr_amplitude"] == pytest.approx(0.3)
+    assert measurement_count == 1
+    assert stage.data["status"] == "accepted"
+    assert "verification" not in stage.data
+    assert stage.accepted_calibration["cr_amplitude"] == pytest.approx(0.4)
 
 
 def test_zx_stage_rejects_a_nonpositive_root(
@@ -794,7 +787,6 @@ def test_zx_stage_rejects_a_nonpositive_root(
         error_amplification_n=1,
         scale_cancellation_with_cr=True,
         n_shots=128,
-        verification_n_shots=256,
         shot_interval=1024.0,
         plot=False,
     )
@@ -837,13 +829,12 @@ def test_cancel_stage_remeasures_once_after_directional_range_expansion(
         error_amplification_n=1,
         scale_cancellation_with_cr=True,
         n_shots=128,
-        verification_n_shots=256,
         shot_interval=1024.0,
         plot=False,
         allow_range_expansion=True,
     )
 
-    assert len(measured_ranges) == 3
+    assert len(measured_ranges) == 2
     assert_allclose(measured_ranges[0], [-0.1, 0.0, 0.1], atol=1e-15)
     assert_allclose(measured_ranges[1], [-0.1, 0.0, 0.1, 0.2], atol=1e-15)
     assert stage.data["root"] == pytest.approx(0.15, abs=1e-15)
@@ -887,13 +878,12 @@ def test_cr_stage_expands_its_single_17_point_sweep(
         error_amplification_n=1,
         scale_cancellation_with_cr=True,
         n_shots=128,
-        verification_n_shots=256,
         shot_interval=1024.0,
         plot=False,
         allow_range_expansion=True,
     )
 
-    assert [values.size for values in measured_ranges] == [17, 25, 2]
+    assert [values.size for values in measured_ranges] == [17, 25]
     assert measured_ranges[1][-1] == pytest.approx(0.66, abs=1e-15)
     assert stage.data["root"] == pytest.approx(0.64, abs=1e-15)
     assert stage.accepted_calibration["cr_amplitude"] == pytest.approx(0.64, abs=1e-15)
@@ -938,13 +928,12 @@ def test_phase_stage_remeasures_once_after_directional_range_expansion(
         error_amplification_n=1,
         scale_cancellation_with_cr=True,
         n_shots=128,
-        verification_n_shots=256,
         shot_interval=1024.0,
         plot=False,
         allow_range_expansion=True,
     )
 
-    assert len(measured_ranges) == 3
+    assert len(measured_ranges) == 2
     assert_allclose(
         measured_ranges[0],
         0.2 + np.linspace(-0.16, 0.16, 17),
@@ -993,7 +982,7 @@ def test_public_workflow_expands_default_phase_sweep_toward_root(
         cr_amplitude_range=[0.3, 0.4, 0.5],
         cancel_y_offsets=[-0.1, 0.0, 0.1],
         cancel_x_offsets=[-0.1, 0.0, 0.1],
-        max_fine_rounds=1,
+        fine_rounds=1,
         plot=False,
     )
 
@@ -1047,7 +1036,6 @@ def test_stage_plot_contains_measurements_and_linear_fit(
         error_amplification_n=1,
         scale_cancellation_with_cr=True,
         n_shots=128,
-        verification_n_shots=256,
         shot_interval=1024.0,
         plot=True,
     )
@@ -1060,45 +1048,11 @@ def test_stage_plot_contains_measurements_and_linear_fit(
     assert shown_figures[0].layout.template.layout.height == 300
 
 
-@pytest.mark.parametrize(
-    ("candidate_ix", "expected_converged"),
-    [(0.01, True), (0.03, False)],
-)
-def test_ix_from_z_diagnostic_uses_measurement_tolerance(
-    candidate_ix: float,
-    expected_converged: bool,
-) -> None:
-    """Small IX diagnostic fluctuations should not force another fine round."""
-
-    def stage(signal: float) -> dict[str, Any]:
-        return {"verification": {"candidate_signal": signal}}
-
-    angle_stage = {
-        "verification": {
-            "candidate_signal": 0.0,
-            "current_parameter": 0.4,
-            "candidate_parameter": 0.5,
-            "sweep_values": np.array([0.4, 0.5]),
-            "diagnostic_signals": {"ix_from_z": np.array([0.0, candidate_ix])},
-        }
-    }
-
-    summary = _verification_summary(
-        angle_stage,
-        stage(0.0),
-        stage(0.0),
-        stage(0.0),
-    )
-
-    assert summary["checks"]["s_ix_from_z_not_worse"] is expected_converged
-    assert summary["converged"] is expected_converged
-
-
 def test_calibrate_srre_zx90_orchestrates_all_stages_and_returns_contract(
     monkeypatch: pytest.MonkeyPatch,
     srre_calibration: dict[str, Any],
 ) -> None:
-    """The public workflow should accept verified roots in the documented order."""
+    """The public workflow should accept fitted roots in the documented order."""
     exp = _Experiment()
     original_srre = deepcopy(srre_calibration)
     calls: list[dict[str, Any]] = []
@@ -1139,9 +1093,8 @@ def test_calibrate_srre_zx90_orchestrates_all_stages_and_returns_contract(
         cancel_y_offsets=[-0.1, -0.05, 0.0, 0.05, 0.1],
         cancel_x_offsets=[-0.1, -0.05, 0.0, 0.05, 0.1],
         error_amplification_n=2,
-        max_fine_rounds=2,
+        fine_rounds=1,
         n_shots=128,
-        verification_n_shots=512,
         shot_interval=2048.0,
         plot=False,
     )
@@ -1162,10 +1115,12 @@ def test_calibrate_srre_zx90_orchestrates_all_stages_and_returns_contract(
         np.angle(calibration["cancel_x"] + 1j * calibration["cancel_y"])
     )
     assert calibration["srre_calibration"]["amplitude"] == 0.3
-    assert calibration["fine_round_count"] == 1
+    assert calibration["requested_fine_rounds"] == 1
+    assert calibration["completed_fine_rounds"] == 1
     assert len(calibration["fine_rounds"]) == 1
-    assert calibration["converged"] is True
-    assert calibration["status"] == "converged"
+    assert "final_verification" not in calibration
+    assert "converged" not in calibration
+    assert calibration["status"] == "completed"
     assert calibration["initial_angle_stage"]["configuration"] == {
         "echo": True,
         "include_srre": True,
@@ -1189,20 +1144,14 @@ def test_calibrate_srre_zx90_orchestrates_all_stages_and_returns_contract(
     }
     assert [call["stage"] for call in calls] == [
         "zx",
-        "zx",
-        "zy",
         "zy",
         "iy",
-        "iy",
         "ix",
-        "ix",
-        "zx",
         "zx",
     ]
     assert all(call["error_amplification_n"] == 2 for call in calls)
     assert calls[0]["n_shots"] == 128
-    assert calls[1]["n_shots"] == 512
-    assert calls[2]["n_shots"] == 128
+    assert all(call["n_shots"] == 128 for call in calls)
     assert exp.note.calls == [f"{CONTROL}-{TARGET}"]
     assert srre_calibration.keys() == original_srre.keys()
     for key, expected in original_srre.items():
@@ -1213,28 +1162,26 @@ def test_calibrate_srre_zx90_orchestrates_all_stages_and_returns_contract(
     assert exp.note.cr_param["cr_amplitude"] == 0.4
 
 
-def test_calibration_runs_a_second_round_only_when_verification_needs_it(
+def test_calibration_runs_exactly_the_requested_number_of_fine_rounds(
     monkeypatch: pytest.MonkeyPatch,
     srre_calibration: dict[str, Any],
 ) -> None:
-    """Persistent verified phase error should stop exactly at max_fine_rounds."""
+    """Fine rounds should be controlled only by the user-provided count."""
     fine_phase_sweeps = 0
+    stages: list[str] = []
 
     def fake_measure_stage(**kwargs: Any) -> Any:
         nonlocal fine_phase_sweeps
         values = np.asarray(kwargs["sweep_values"], dtype=float)
         stage = kwargs["stage"]
+        stages.append(stage)
         root = float((values[0] + values[-1]) / 2)
         if stage == "zy" and values.size > 2:
-            root += 0.01
-        if stage == "zy" and values.size > 2:
             fine_phase_sweeps += 1
-        candidate_signal = 0.05 if stage == "zy" and values.size <= 2 else 0.0
         return _mock_stage_measurement(
             sweep_values=values,
             stage=stage,
             root=root,
-            candidate_signal=candidate_signal,
         )
 
     monkeypatch.setattr(calibration_module, "_measure_stage", fake_measure_stage)
@@ -1246,23 +1193,25 @@ def test_calibration_runs_a_second_round_only_when_verification_needs_it(
         srre_ramp_time=20.0,
         srre_calibration=srre_calibration,
         cr_amplitude_range=[0.3, 0.4, 0.5],
-        max_fine_rounds=2,
+        fine_rounds=2,
         plot=False,
     )
 
     calibration = cast(dict[str, Any], result.data["srre_cr_calibration"])
     assert fine_phase_sweeps == 2
-    assert calibration["fine_round_count"] == 2
+    assert stages == ["zx", "zy", "iy", "ix", "zx", "zy", "iy", "ix", "zx"]
+    assert calibration["requested_fine_rounds"] == 2
+    assert calibration["completed_fine_rounds"] == 2
     assert len(calibration["fine_rounds"]) == 2
-    assert calibration["converged"] is False
-    assert calibration["status"] == "max_fine_rounds_reached"
+    assert all(item["status"] == "completed" for item in calibration["fine_rounds"])
+    assert calibration["status"] == "completed"
 
 
-def test_failed_root_or_verification_preserves_last_accepted_parameters(
+def test_failed_root_preserves_last_accepted_parameters(
     monkeypatch: pytest.MonkeyPatch,
     srre_calibration: dict[str, Any],
 ) -> None:
-    """A failed fine-stage root should retain the verified initial CR state."""
+    """A failed fine-stage root should retain the accepted initial CR state."""
     zx_sweep = True
 
     def fake_measure_stage(**kwargs: Any) -> Any:
@@ -1303,6 +1252,9 @@ def test_failed_root_or_verification_preserves_last_accepted_parameters(
     assert calibration["cr_amplitude"] == pytest.approx(0.42, abs=1e-14)
     assert calibration["cr_phase"] == pytest.approx(0.2, abs=1e-14)
     assert calibration["status"] == "failed"
+    assert calibration["requested_fine_rounds"] == 1
+    assert calibration["completed_fine_rounds"] == 0
+    assert calibration["fine_rounds"][0]["status"] == "failed"
     assert calibration["fine_rounds"][0]["phase_stage"]["status"] == "failed"
     assert (
         "slope is too small" in calibration["fine_rounds"][0]["phase_stage"]["reason"]
@@ -1365,6 +1317,29 @@ def test_invalid_fine_offsets_fail_before_any_stage_measurement(
             srre_ramp_time=20.0,
             srre_calibration=srre_calibration,
             cr_phase_offsets=[0.0, 0.0],
+            plot=False,
+        )
+
+
+@pytest.mark.parametrize(
+    ("fine_rounds", "error_type"),
+    [(0, ValueError), (-1, ValueError), (1.5, TypeError), (True, TypeError)],
+)
+def test_fine_rounds_must_be_a_positive_integer(
+    srre_calibration: dict[str, Any],
+    fine_rounds: Any,
+    error_type: type[Exception],
+) -> None:
+    """The fixed fine-round count should reject zero and non-integers."""
+    with pytest.raises(error_type, match="fine_rounds"):
+        calibrate_srre_zx90(
+            cast(Any, _Experiment()),
+            CONTROL,
+            TARGET,
+            cr_half_duration=192.0,
+            srre_ramp_time=20.0,
+            srre_calibration=srre_calibration,
+            fine_rounds=fine_rounds,
             plot=False,
         )
 

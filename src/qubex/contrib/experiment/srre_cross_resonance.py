@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from numbers import Real
 from typing import Any
 
 import numpy as np
@@ -89,7 +90,9 @@ def srre_rzx(
     angle : float
         Requested RZX rotation angle in radians.
     calibration : Mapping[str, Any]
-        `srre_cr_calibration` mapping returned by `calibrate_srre_zx90`.
+        Successful `srre_cr_calibration` mapping returned by
+        `calibrate_srre_zx90`. If the mapping contains a `status` field, it
+        must be `"completed"`.
     x180 : TargetMap[Waveform] | Waveform, optional
         Control X180 waveform or target mapping. The calibrated control X180 is
         used by default.
@@ -181,6 +184,11 @@ def _build_srre_cross_resonance(
 def _parse_calibration(calibration: Mapping[str, Any]) -> _SrreCrParameters:
     if not isinstance(calibration, Mapping):
         raise TypeError("calibration must be a mapping.")
+    status = calibration.get("status")
+    if status is not None and status != "completed":
+        raise ValueError(
+            "calibration status must be 'completed' before building an SRRE gate."
+        )
     cancel_x = _as_finite_float(_required(calibration, "cancel_x"), name="cancel_x")
     cancel_y = _as_finite_float(_required(calibration, "cancel_y"), name="cancel_y")
 
@@ -466,12 +474,9 @@ def _as_label(value: Any, *, name: str) -> str:
 
 
 def _as_finite_float(value: Any, *, name: str) -> float:
-    if isinstance(value, (bool, np.bool_)):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
         raise TypeError(f"{name} must be a real number.")
-    try:
-        scalar = float(value)
-    except (TypeError, ValueError) as exc:
-        raise TypeError(f"{name} must be a real number.") from exc
+    scalar = float(value)
     if not np.isfinite(scalar):
         raise ValueError(f"{name} must be finite.")
     return scalar

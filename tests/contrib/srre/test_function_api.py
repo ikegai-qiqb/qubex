@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from inspect import signature
+
 from qubex.contrib import (
     calculate_srre_moments,
     calibrate_srre,
@@ -38,3 +40,12 @@ def test_all_srre_functions_are_exported_from_experiment() -> None:
     assert experiment_calibrate_srre is calibrate_srre
     assert experiment_srre_rzx is srre_rzx
     assert experiment_calibrate_srre_zx90 is calibrate_srre_zx90
+
+
+def test_calibrate_srre_zx90_public_signature_uses_fine_rounds() -> None:
+    """The public API should expose fixed rounds and no verification controls."""
+    parameters = signature(calibrate_srre_zx90).parameters
+
+    assert parameters["fine_rounds"].default == 1
+    assert "max_fine_rounds" not in parameters
+    assert "verification_n_shots" not in parameters
