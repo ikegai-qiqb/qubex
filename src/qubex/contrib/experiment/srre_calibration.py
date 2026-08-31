@@ -6,21 +6,20 @@ from dataclasses import dataclass
 from numbers import Real
 
 import numpy as np
+import plotly.graph_objects as go
 from numpy.typing import ArrayLike, NDArray
 
 from qubex.experiment import Experiment
-from qubex.experiment.experiment_constants import (
-    CALIBRATION_SHOTS,
-    DEFAULT_INTERVAL,
-)
+from qubex.experiment.experiment_constants import CALIBRATION_SHOTS
 from qubex.experiment.models.result import Result
+from qubex.measurement.measurement_defaults import resolve_measurement_defaults
 from qubex.pulse import Arbitrary, PulseSchedule, Waveform
 
 from .srre_waveform import predict_srre_amplitude, srre_waveform
 
 __all__ = ["calibrate_srre"]
 
-_DEFAULT_SWEEP_FRACTIONS = np.linspace(-0.1, 0.1, 5)
+_DEFAULT_SWEEP_FRACTIONS = np.linspace(-0.08, 0.08, 17)
 _MIN_ABSOLUTE_SLOPE = 1e-9
 _SAMPLING_PERIOD_TOLERANCE = 1e-12
 _HARDWARE_AMPLITUDE_LIMIT = 1.0
@@ -32,6 +31,8 @@ class _ZeroCrossingAnalysis:
     root: float
     root_bracket: tuple[float, float]
     fit_slope: float
+    fit_intercept: float
+    fitted_signal: NDArray[np.float64]
     differential_signal: NDArray[np.float64]
 
 
@@ -44,7 +45,7 @@ def calibrate_srre(
     amplitude_range: ArrayLike | None = None,
     amplitude_bounds: tuple[float, float] = (0.0, 1.0),
     probe_detuning: float | None = None,
-    repetitions: int = 1,
+    repetitions: int = 4,
     n_shots: int | None = None,
     shot_interval: float | None = None,
     plot: bool = True,
@@ -55,8 +56,8 @@ def calibrate_srre(
     For each candidate amplitude, this experiment prepares `|+X>`, applies
     repeated SRRE under `+probe_detuning` and `-probe_detuning`, projects along
     the predicted analysis axis, and measures target Z. The accepted amplitude
-    is obtained only from the measured sign-changing bracket nearest the
-    predicted `F0=0` root.
+    is the zero crossing of one least-squares line fitted to every measured
+    differential-signal point.
 
     Parameters
     ----------
@@ -69,22 +70,23 @@ def calibrate_srre(
     ramp_time : float
         Ramp-up and ramp-down duration of each lobe in ns.
     amplitude_range : ArrayLike | None, optional
-        Strictly increasing candidate peak amplitudes. Defaults to five points
-        spanning ±10% around the predicted root, clipped to `amplitude_bounds`.
+        Strictly increasing candidate peak amplitudes. Defaults to 17 points
+        spanning ±8% around the predicted root, clipped to `amplitude_bounds`.
     amplitude_bounds : tuple[float, float], optional
         Non-negative hardware amplitude bounds used for root prediction.
     probe_detuning : float | None, optional
         Positive detuning magnitude in GHz. Defaults to a value accumulating
-        pi/4 phase over the complete repeated SRRE sequence. An explicit value
+        pi/2 phase over the complete repeated SRRE sequence. An explicit value
         must be below the waveform sampling Nyquist frequency.
     repetitions : int, optional
-        Positive number of contiguous SRRE blocks. Defaults to `1`.
+        Positive number of contiguous SRRE blocks. Defaults to `4`.
     n_shots : int | None, optional
         Shots per detuning and amplitude point. Defaults to calibration shots.
     shot_interval : float | None, optional
-        Shot interval in ns. Defaults to the repository calibration interval.
+        Shot interval in ns. Defaults to the current experiment context.
     plot : bool, optional
-        Whether the underlying interleaved sweep should be plotted.
+        Whether to plot differential signal against amplitude together with
+        the fitted line.
 
     Returns
     -------
@@ -94,8 +96,8 @@ def calibrate_srre(
     Raises
     ------
     ValueError
-        If inputs, reference pulses, or measured signals are invalid, or no
-        sufficiently sloped measured bracket contains a zero crossing.
+        If inputs, reference pulses, or measured signals are invalid, or the
+        fitted root is outside the measured amplitude range.
     TypeError
         If an array or scalar input has an incompatible type.
 
@@ -113,7 +115,7 @@ def calibrate_srre(
     )
     resolved_interval = _resolve_optional_positive_float(
         shot_interval,
-        default=DEFAULT_INTERVAL,
+        default=_context_shot_interval(exp),
         name="shot_interval",
     )
     if not isinstance(plot, (bool, np.bool_)):
@@ -174,7 +176,7 @@ def calibrate_srre(
         sweep_range=np.arange(len(sweep_points)),
         n_shots=resolved_shots,
         shot_interval=resolved_interval,
-        plot=plot,
+        plot=False,
         title=f"SRRE amplitude calibration: {target}",
         xlabel="Interleaved amplitude/detuning point",
         ylabel="Normalized target Z",
@@ -197,8 +199,16 @@ def calibrate_srre(
         amplitudes=amplitudes,
         signal_plus=signal_plus,
         signal_minus=signal_minus,
-        predicted_amplitude=prediction.amplitude,
     )
+    if plot:
+        _plot_linear_fit(
+            amplitudes,
+            analysis.differential_signal,
+            analysis.fitted_signal,
+            title=f"SRRE amplitude calibration: {target}",
+            xlabel="SRRE amplitude",
+            ylabel="Differential signal",
+        )
     calibrated_rabi_rate = rabi_rate_from_amplitude(analysis.root)
     if not np.isfinite(calibrated_rabi_rate):
         raise ValueError("The calibrated amplitude must map to a finite Rabi rate.")
@@ -222,6 +232,8 @@ def calibrate_srre(
                 "f1_predicted": prediction.f1,
                 "root_bracket": analysis.root_bracket,
                 "fit_slope": analysis.fit_slope,
+                "fit_intercept": analysis.fit_intercept,
+                "fitted_signal": analysis.fitted_signal,
                 "amplitude_range": amplitudes,
                 "signal_plus": signal_plus,
                 "signal_minus": signal_minus,
@@ -297,9 +309,8 @@ def _analyze_zero_crossing(
     amplitudes: ArrayLike,
     signal_plus: ArrayLike,
     signal_minus: ArrayLike,
-    predicted_amplitude: float,
 ) -> _ZeroCrossingAnalysis:
-    """Find the measured zero-crossing bracket nearest a prediction."""
+    """Fit one line to the measured differential signal and return its root."""
     amplitude_values = _as_finite_vector(amplitudes, name="amplitudes")
     plus_values = _as_finite_vector(signal_plus, name="signal_plus")
     minus_values = _as_finite_vector(signal_minus, name="signal_minus")
@@ -307,48 +318,20 @@ def _analyze_zero_crossing(
         raise ValueError("signal_plus must have the same shape as amplitudes.")
     if minus_values.shape != amplitude_values.shape:
         raise ValueError("signal_minus must have the same shape as amplitudes.")
-    if not np.isfinite(predicted_amplitude):
-        raise ValueError("predicted_amplitude must be finite.")
     if amplitude_values.size < 2:
         raise ValueError("amplitudes must contain at least two points.")
     if np.any(np.diff(amplitude_values) <= 0):
         raise ValueError("amplitudes must be strictly increasing.")
 
     differential = (plus_values - minus_values) / 2.0
-    candidates: list[tuple[float, float, float, float]] = []
-    for index in range(amplitude_values.size - 1):
-        lower = float(amplitude_values[index])
-        upper = float(amplitude_values[index + 1])
-        lower_signal = float(differential[index])
-        upper_signal = float(differential[index + 1])
-        if (
-            lower_signal != 0.0
-            and upper_signal != 0.0
-            and np.signbit(lower_signal) == np.signbit(upper_signal)
-        ):
-            continue
-        slope = (upper_signal - lower_signal) / (upper - lower)
-        if lower_signal == 0.0:
-            root = lower
-        elif upper_signal == 0.0:
-            root = upper
-        else:
-            root = lower - lower_signal / slope
-        candidates.append((root, lower, upper, slope))
-
-    if not candidates:
-        raise ValueError("Measured SRRE differential signal does not bracket a root.")
-    root, lower, upper, slope = min(
-        candidates,
-        key=lambda candidate: (
-            abs(candidate[0] - predicted_amplitude),
-            candidate[1],
-        ),
-    )
+    slope, intercept, fitted_signal = _fit_line(amplitude_values, differential)
     if not np.isfinite(slope) or abs(slope) < _MIN_ABSOLUTE_SLOPE:
         raise ValueError("Measured SRRE zero-crossing slope is too small.")
+    root = -intercept / slope
+    lower = float(amplitude_values[0])
+    upper = float(amplitude_values[-1])
     if not lower <= root <= upper:
-        raise ValueError("Measured SRRE root lies outside its bracket.")
+        raise ValueError("Fitted SRRE root lies outside the measured amplitude range.")
     if root <= 0.0:
         raise ValueError("Measured SRRE amplitude root must be positive.")
 
@@ -356,8 +339,45 @@ def _analyze_zero_crossing(
         root=float(root),
         root_bracket=(lower, upper),
         fit_slope=float(slope),
+        fit_intercept=float(intercept),
+        fitted_signal=fitted_signal,
         differential_signal=differential,
     )
+
+
+def _fit_line(
+    x_values: NDArray[np.float64],
+    y_values: NDArray[np.float64],
+) -> tuple[float, float, NDArray[np.float64]]:
+    """Return a least-squares line and its values on the supplied grid."""
+    centered_x = x_values - np.mean(x_values)
+    denominator = float(np.dot(centered_x, centered_x))
+    if denominator == 0.0:
+        raise ValueError("Linear fit requires at least two distinct x values.")
+    slope = float(np.dot(centered_x, y_values - np.mean(y_values)) / denominator)
+    intercept = float(np.mean(y_values) - slope * np.mean(x_values))
+    return slope, intercept, slope * x_values + intercept
+
+
+def _plot_linear_fit(
+    x_values: NDArray[np.float64],
+    signal: NDArray[np.float64],
+    fitted_signal: NDArray[np.float64],
+    *,
+    title: str,
+    xlabel: str,
+    ylabel: str,
+) -> None:
+    """Show measured zero-crossing data together with its fitted line."""
+    figure = go.Figure()
+    figure.add_trace(
+        go.Scatter(x=x_values, y=signal, mode="markers", name="Measurement")
+    )
+    figure.add_trace(
+        go.Scatter(x=x_values, y=fitted_signal, mode="lines", name="Linear fit")
+    )
+    figure.update_layout(title=title, xaxis_title=xlabel, yaxis_title=ylabel)
+    figure.show()
 
 
 def _resolve_amplitude_range(
@@ -391,7 +411,7 @@ def _resolve_probe_detuning(
     sampling_period: float,
 ) -> float:
     if probe_detuning is None:
-        return 1.0 / (8.0 * block_duration * repetitions)
+        return 1.0 / (4.0 * block_duration * repetitions)
     value = _as_finite_float(probe_detuning, name="probe_detuning")
     if value == 0:
         raise ValueError("probe_detuning must be non-zero.")
@@ -408,6 +428,14 @@ def _resolve_probe_detuning(
 
 def _validate_repetitions(repetitions: int) -> int:
     return _as_positive_integer(repetitions, name="repetitions")
+
+
+def _context_shot_interval(exp: Experiment) -> float:
+    """Resolve the configured shot interval for the current experiment context."""
+    experiment_system = getattr(exp.ctx, "experiment_system", None)
+    configured_defaults = getattr(experiment_system, "measurement_defaults", None)
+    defaults = resolve_measurement_defaults(configured_defaults)
+    return float(defaults.execution.shot_interval_ns)
 
 
 def _validate_label(value: object, *, name: str) -> None:
@@ -481,6 +509,8 @@ def _validate_reference_pulse(
     name: str,
     sampling_period: float,
 ) -> None:
+    if not isinstance(pulse, Waveform):
+        raise TypeError(f"{name} must be a Waveform.")
     if not np.isclose(
         pulse.sampling_period,
         sampling_period,

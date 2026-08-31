@@ -410,11 +410,14 @@ def _integrate_modulation(
     # For one normalized sample interval with angle step `s`:
     # integral(exp(i*s*u), u=0..1) = exp(i*s/2) * j0(s/2),
     # integral(u*exp(i*s*u), u=0..1) = exp(i*s/2) * (j0+i*j1) / 2.
-    spherical_j0 = spherical_jn(0, half_angles)
-    zeroth_interval_moments = centered_phases * spherical_j0
-    first_interval_moments = (
-        centered_phases * (spherical_j0 + 1j * spherical_jn(1, half_angles)) / 2
+    absolute_half_angles = np.abs(half_angles)
+    spherical_j0 = spherical_jn(0, absolute_half_angles)
+    spherical_j1 = np.copysign(
+        spherical_jn(1, absolute_half_angles),
+        half_angles,
     )
+    zeroth_interval_moments = centered_phases * spherical_j0
+    first_interval_moments = centered_phases * (spherical_j0 + 1j * spherical_j1) / 2
 
     modulation_integrals = sampling_period * phase_starts * zeroth_interval_moments
     interval_starts = np.arange(len(angle_steps)) * sampling_period

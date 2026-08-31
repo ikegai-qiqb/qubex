@@ -9,14 +9,13 @@ from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
 import numpy as np
+import plotly.graph_objects as go
 from numpy.typing import ArrayLike, NDArray
 
 from qubex.experiment import Experiment
-from qubex.experiment.experiment_constants import (
-    CALIBRATION_SHOTS,
-    DEFAULT_INTERVAL,
-)
+from qubex.experiment.experiment_constants import CALIBRATION_SHOTS
 from qubex.experiment.models.result import Result
+from qubex.measurement.measurement_defaults import resolve_measurement_defaults
 from qubex.pulse import Arbitrary, PulseArray, PulseSchedule, Waveform
 
 from .srre_calibration import calibrate_srre
@@ -31,9 +30,12 @@ _DURATION_UNIT = 16.0
 _NUMERIC_TOLERANCE = 1e-12
 _MIN_ABSOLUTE_SLOPE = 1e-9
 _SIGNAL_TOLERANCE = 0.02
-_DEFAULT_CR_SWEEP_FACTORS = np.linspace(0.9, 1.1, 5)
-_DEFAULT_PHASE_OFFSETS = np.linspace(-0.1, 0.1, 5)
-_DEFAULT_CANCEL_OFFSETS = np.linspace(-0.05, 0.05, 5)
+_DEFAULT_CR_SWEEP_FACTORS = np.linspace(0.84, 1.16, 9)
+_FINE_CR_SWEEP_FACTORS = np.linspace(0.92, 1.08, 17)
+_DEFAULT_PHASE_OFFSETS = np.linspace(-0.16, 0.16, 17)
+_DEFAULT_CANCEL_SWEEP_POINTS = 21
+_DEFAULT_CANCEL_EDGE_ROTATION = 0.2
+_MAX_SWEEP_EXPANSION_FACTOR = 2.0
 _STAGE_CONFIGURATIONS: dict[_Stage, tuple[bool, bool]] = {
     "zx": (True, True),
     "zy": (True, False),
@@ -64,6 +66,8 @@ class _ZeroCrossingAnalysis:
     root: float
     root_bracket: tuple[float, float]
     fit_slope: float
+    fit_intercept: float
+    fitted_signal: NDArray[np.float64]
 
 
 @dataclass(frozen=True)
@@ -155,15 +159,21 @@ def calibrate_srre_zx90(
     probe_detuning : float | None, optional
         Positive one-qubit SRRE probe detuning in GHz.
     cr_amplitude_range : ArrayLike | None, optional
-        Strictly increasing absolute CR amplitudes for stages 8 and 11. When
-        omitted, five points spanning +/-10% around the ZX90 amplitude predicted
-        for the fixed CR-half duration are used.
+        Strictly increasing positive absolute CR amplitudes not exceeding one
+        for stages 8 and 11. When omitted, nine points spanning +/-16% around
+        the ZX90 amplitude predicted for the fixed CR-half duration are used.
+        The fitted root is subsequently fine-tuned over 17 points spanning
+        +/-8%.
     cr_phase_offsets : ArrayLike | None, optional
-        Strictly increasing phase offsets in radians for stage 9a.
+        Strictly increasing phase offsets in radians for stage 9a. Defaults to
+        17 points spanning +/-0.16 rad.
     cancel_y_offsets : ArrayLike | None, optional
-        Strictly increasing cancellation-Y offsets for stage 9b.
+        Strictly increasing cancellation-Y offsets for stage 9b. By default,
+        target Rabi parameters set 21 symmetric points whose sweep edges rotate
+        by `0.2 / N` rad in one candidate gate.
     cancel_x_offsets : ArrayLike | None, optional
-        Strictly increasing cancellation-X offsets for stage 9c.
+        Strictly increasing cancellation-X offsets for stage 9c. Its default is
+        resolved in the same way as `cancel_y_offsets`.
     error_amplification_n : int, optional
         Positive `N`; fine-stage sequences contain exactly `2N` cycles.
     max_fine_rounds : int, optional
@@ -175,9 +185,10 @@ def calibrate_srre_zx90(
     verification_n_shots : int | None, optional
         Shots per fresh verification point. Defaults to `n_shots`.
     shot_interval : float | None, optional
-        Shot interval in ns. Defaults to the calibration interval.
+        Shot interval in ns. Defaults to the current experiment context.
     plot : bool, optional
-        Whether individual state sweeps should be plotted.
+        Whether to plot every differential calibration signal together with its
+        linear fit.
 
     Returns
     -------
@@ -224,7 +235,7 @@ def calibrate_srre_zx90(
     )
     resolved_interval = _resolve_optional_positive_float(
         shot_interval,
-        default=DEFAULT_INTERVAL,
+        default=_context_shot_interval(exp),
         name="shot_interval",
     )
 
@@ -245,6 +256,15 @@ def calibrate_srre_zx90(
         cr_amplitude_range,
         center_amplitude=duration_resolution.predicted_cr_amplitude,
     )
+    default_cancel_offsets: NDArray[np.float64] | None = None
+    if cancel_y_offsets is None or cancel_x_offsets is None:
+        default_cancel_offsets = _default_cancel_offsets(
+            exp,
+            target_qubit,
+            cr_half_duration=duration_resolution.resolved_duration,
+            cr_ramptime=cr_parameters["cr_ramptime"],
+            error_amplification_n=error_amplification_n,
+        )
     fine_offsets: dict[_Stage, NDArray[np.float64]] = {
         "zy": _resolve_offsets(
             cr_phase_offsets,
@@ -253,12 +273,12 @@ def calibrate_srre_zx90(
         ),
         "iy": _resolve_offsets(
             cancel_y_offsets,
-            default=_DEFAULT_CANCEL_OFFSETS,
+            default=default_cancel_offsets,
             name="cancel_y_offsets",
         ),
         "ix": _resolve_offsets(
             cancel_x_offsets,
-            default=_DEFAULT_CANCEL_OFFSETS,
+            default=default_cancel_offsets,
             name="cancel_x_offsets",
         ),
     }
@@ -298,6 +318,8 @@ def calibrate_srre_zx90(
         verification_n_shots=resolved_verification_shots,
         shot_interval=resolved_interval,
         plot=plot,
+        allow_range_expansion=True,
+        fine_tune_cr=True,
     )
     accepted = initial_angle.accepted_calibration
 
@@ -389,16 +411,15 @@ def _calculate_ix_signal(measurements: ArrayLike) -> float:
     return float((d0 + d1) / 2.0)
 
 
-def _find_closest_zero_crossing(
+def _fit_zero_crossing(
     *,
     sweep_values: ArrayLike,
     error_signal: ArrayLike,
-    reference: float,
+    allow_outside: bool = False,
 ) -> _ZeroCrossingAnalysis:
-    """Interpolate the measured sign-changing bracket nearest a reference."""
+    """Fit one line to a calibration signal and return its zero crossing."""
     values = _as_finite_vector(sweep_values, name="sweep_values")
     signal = _as_finite_vector(error_signal, name="error_signal")
-    reference = _as_finite_float(reference, name="reference")
     if values.shape != signal.shape:
         raise ValueError("error_signal must have the same shape as sweep_values.")
     if values.size < 2:
@@ -406,43 +427,25 @@ def _find_closest_zero_crossing(
     if np.any(np.diff(values) <= 0.0):
         raise ValueError("sweep_values must be strictly increasing.")
 
-    candidates: list[tuple[float, float, float, float]] = []
-    for index in range(values.size - 1):
-        lower = float(values[index])
-        upper = float(values[index + 1])
-        lower_signal = float(signal[index])
-        upper_signal = float(signal[index + 1])
-        if lower_signal == 0.0 and upper_signal == 0.0:
-            continue
-        if (
-            lower_signal != 0.0
-            and upper_signal != 0.0
-            and np.signbit(lower_signal) == np.signbit(upper_signal)
-        ):
-            continue
-        slope = (upper_signal - lower_signal) / (upper - lower)
-        if lower_signal == 0.0:
-            root = lower
-        elif upper_signal == 0.0:
-            root = upper
-        else:
-            root = lower - lower_signal / slope
-        candidates.append((root, lower, upper, slope))
-
-    if not candidates:
-        raise ValueError("Measured calibration signal does not bracket a root.")
-    root, lower, upper, slope = min(
-        candidates,
-        key=lambda candidate: (abs(candidate[0] - reference), candidate[1]),
-    )
+    centered_values = values - np.mean(values)
+    denominator = float(np.dot(centered_values, centered_values))
+    if denominator == 0.0:
+        raise ValueError("Linear fit requires at least two distinct sweep values.")
+    slope = float(np.dot(centered_values, signal - np.mean(signal)) / denominator)
     if not np.isfinite(slope) or abs(slope) < _MIN_ABSOLUTE_SLOPE:
         raise ValueError("Measured zero-crossing slope is too small.")
-    if not lower <= root <= upper:
-        raise ValueError("Measured root lies outside its bracket.")
+    intercept = float(np.mean(signal) - slope * np.mean(values))
+    root = -intercept / slope
+    lower = float(values[0])
+    upper = float(values[-1])
+    if not allow_outside and not lower <= root <= upper:
+        raise ValueError("Fitted root lies outside the measured sweep range.")
     return _ZeroCrossingAnalysis(
         root=float(root),
         root_bracket=(lower, upper),
         fit_slope=float(slope),
+        fit_intercept=intercept,
+        fitted_signal=slope * values + intercept,
     )
 
 
@@ -648,7 +651,6 @@ def _measure_stage(
     scale_cancellation_with_cr: bool,
     n_shots: int,
     shot_interval: float,
-    plot: bool,
 ) -> _StageMeasurement:
     """Measure the four state series for one parameter-specific stage."""
     values = _as_finite_vector(sweep_values, name="sweep_values")
@@ -691,7 +693,7 @@ def _measure_stage(
             },
             n_shots=n_shots,
             shot_interval=shot_interval,
-            plot=plot,
+            plot=False,
             title=f"SRRE-CR {stage.upper()} calibration: {control_qubit}-{target_qubit}",
             xlabel=_stage_parameter_name(stage),
             ylabel="Normalized target Z",
@@ -709,10 +711,6 @@ def _measure_stage(
             raise ValueError(
                 "Each four-state series must return one scalar per sweep point; "
                 f"expected {values.shape}, got {normalized.shape}."
-            )
-        if not np.all(np.isfinite(normalized)):
-            raise ValueError(
-                "Four-state measurement data must contain only finite values."
             )
         state_values[state_index] = normalized
 
@@ -743,6 +741,60 @@ def _measure_stage(
     )
 
 
+def _measure_fitted_stage(
+    exp: Experiment,
+    control_qubit: str,
+    target_qubit: str,
+    *,
+    calibration: Mapping[str, Any],
+    stage: _Stage,
+    sweep_values: ArrayLike,
+    root_reference: float,
+    error_amplification_n: int,
+    scale_cancellation_with_cr: bool,
+    n_shots: int,
+    shot_interval: float,
+    plot: bool,
+    allow_range_expansion: bool,
+) -> tuple[_StageMeasurement, _ZeroCrossingAnalysis, list[dict[str, Any]]]:
+    """Measure and fit a stage, extending once toward an out-of-range root."""
+    values = _as_finite_vector(sweep_values, name="sweep_values")
+    fit_history: list[dict[str, Any]] = []
+    for attempt in range(2):
+        measurement = _measure_stage(
+            exp=exp,
+            control_qubit=control_qubit,
+            target_qubit=target_qubit,
+            calibration=calibration,
+            stage=stage,
+            sweep_values=values,
+            error_amplification_n=error_amplification_n,
+            scale_cancellation_with_cr=scale_cancellation_with_cr,
+            n_shots=n_shots,
+            shot_interval=shot_interval,
+        )
+        analysis = _fit_zero_crossing(
+            sweep_values=measurement.sweep_values,
+            error_signal=measurement.error_signal,
+            allow_outside=True,
+        )
+        fit_history.append(_fit_measurement_data(measurement, analysis))
+        if plot:
+            _plot_stage_fit(measurement, analysis, stage=stage)
+        lower, upper = analysis.root_bracket
+        if lower <= analysis.root <= upper:
+            return measurement, analysis, fit_history
+        if not allow_range_expansion or attempt == 1:
+            return measurement, analysis, fit_history
+        values = _expand_sweep_toward_root(
+            values,
+            center=root_reference,
+            root=analysis.root,
+            bounds=(0.0, 1.0) if stage == "zx" else None,
+        )
+    raise RuntimeError("Unreachable fitted-stage state.")
+
+
 def _run_parameter_stage(
     exp: Experiment,
     control_qubit: str,
@@ -758,32 +810,54 @@ def _run_parameter_stage(
     verification_n_shots: int,
     shot_interval: float,
     plot: bool,
+    allow_range_expansion: bool = False,
+    fine_tune_cr: bool = False,
 ) -> _StageRun:
     """Sweep, propose, freshly verify, and conditionally accept one parameter."""
+    if fine_tune_cr and stage != "zx":
+        raise ValueError("fine_tune_cr is supported only for the ZX stage.")
     current = _copy_calibration(accepted)
     current_parameter = _stage_parameter_value(current, stage=stage)
     input_params = _parameter_snapshot(current)
     configuration = _configuration_data(stage)
     measurement: _StageMeasurement | None = None
+    analysis: _ZeroCrossingAnalysis | None = None
+    fit_history: list[dict[str, Any]] = []
     try:
-        measurement = _measure_stage(
-            exp=exp,
-            control_qubit=control_qubit,
-            target_qubit=target_qubit,
+        measurement, analysis, fit_history = _measure_fitted_stage(
+            exp,
+            control_qubit,
+            target_qubit,
             calibration=current,
             stage=stage,
             sweep_values=sweep_values,
+            root_reference=root_reference,
             error_amplification_n=error_amplification_n,
             scale_cancellation_with_cr=scale_cancellation_with_cr,
             n_shots=n_shots,
             shot_interval=shot_interval,
             plot=plot,
+            allow_range_expansion=allow_range_expansion,
         )
-        analysis = _find_closest_zero_crossing(
-            sweep_values=measurement.sweep_values,
-            error_signal=measurement.error_signal,
-            reference=root_reference,
-        )
+        _require_root_in_measured_range(analysis)
+        if fine_tune_cr:
+            measurement, analysis, fine_history = _measure_fitted_stage(
+                exp,
+                control_qubit,
+                target_qubit,
+                calibration=current,
+                stage=stage,
+                sweep_values=_fine_cr_amplitude_range(analysis.root),
+                root_reference=analysis.root,
+                error_amplification_n=error_amplification_n,
+                scale_cancellation_with_cr=scale_cancellation_with_cr,
+                n_shots=n_shots,
+                shot_interval=shot_interval,
+                plot=plot,
+                allow_range_expansion=allow_range_expansion,
+            )
+            fit_history.extend(fine_history)
+            _require_root_in_measured_range(analysis)
         proposed = _apply_stage_candidate(
             current,
             stage=stage,
@@ -796,7 +870,9 @@ def _run_parameter_stage(
                 input_params=input_params,
                 configuration=configuration,
                 measurement=measurement,
+                analysis=analysis,
                 reason=str(exc),
+                fit_history=fit_history,
             ),
             accepted_calibration=current,
         )
@@ -818,7 +894,6 @@ def _run_parameter_stage(
             scale_cancellation_with_cr=scale_cancellation_with_cr,
             n_shots=verification_n_shots,
             shot_interval=shot_interval,
-            plot=False,
         )
         candidate_index = _matching_index(
             verification.sweep_values,
@@ -845,6 +920,7 @@ def _run_parameter_stage(
             reason=str(exc),
             current_parameter=current_parameter,
             verification=verification,
+            fit_history=fit_history,
         )
 
     same_parameter = np.isclose(
@@ -869,6 +945,7 @@ def _run_parameter_stage(
             current_parameter=current_parameter,
             current_signal=current_signal,
             candidate_signal=candidate_signal,
+            fit_history=fit_history,
         )
 
     converged = abs(candidate_signal) <= _SIGNAL_TOLERANCE
@@ -891,6 +968,9 @@ def _run_parameter_stage(
             "root": analysis.root,
             "root_bracket": analysis.root_bracket,
             "fit_slope": analysis.fit_slope,
+            "fit_intercept": analysis.fit_intercept,
+            "fitted_signal": analysis.fitted_signal.copy(),
+            "fit_history": fit_history,
             "fit_quality": _fit_quality(analysis),
             "verification": verification_data,
             "configuration": configuration,
@@ -938,6 +1018,7 @@ def _run_fine_round(
             verification_n_shots=verification_n_shots,
             shot_interval=shot_interval,
             plot=plot,
+            allow_range_expansion=stage in ("iy", "ix"),
         )
         round_data[data_key] = stage_run.data
         current = stage_run.accepted_calibration
@@ -970,6 +1051,8 @@ def _run_fine_round(
         verification_n_shots=verification_n_shots,
         shot_interval=shot_interval,
         plot=plot,
+        allow_range_expansion=True,
+        fine_tune_cr=True,
     )
     round_data["final_angle_stage"] = final_angle.data
     current = final_angle.accepted_calibration
@@ -1191,8 +1274,8 @@ def _apply_stage_candidate(
         current_amplitude = _as_positive_float(
             result["cr_amplitude"], name="current cr_amplitude"
         )
-        if value < 0.0:
-            raise ValueError("CR amplitude candidates must be non-negative.")
+        if value <= 0.0:
+            raise ValueError("CR amplitude candidates must be positive.")
         if scale_cancellation_with_cr:
             scale = value / current_amplitude
             result["cancel_x"] = float(result["cancel_x"] * scale)
@@ -1213,6 +1296,12 @@ def _validated_stage_root(root: float, *, stage: _Stage) -> float:
     if stage == "zx" and root <= 0.0:
         raise ValueError("The measured ZX90 CR amplitude root must be positive.")
     return root
+
+
+def _require_root_in_measured_range(analysis: _ZeroCrossingAnalysis) -> None:
+    lower, upper = analysis.root_bracket
+    if not lower <= analysis.root <= upper:
+        raise ValueError("Fitted root lies outside the measured sweep range.")
 
 
 def _stage_parameter_value(
@@ -1240,18 +1329,121 @@ def _resolve_cr_amplitude_range(
         raise ValueError("cr_amplitude_range must contain at least two points.")
     if np.any(np.diff(result) <= 0.0):
         raise ValueError("cr_amplitude_range must be strictly increasing.")
-    if result[0] < 0.0 or result[-1] > 1.0 + _NUMERIC_TOLERANCE:
-        raise ValueError("cr_amplitude_range must lie within [0, 1].")
+    if result[0] <= 0.0 or result[-1] > 1.0 + _NUMERIC_TOLERANCE:
+        raise ValueError("cr_amplitude_range values must be positive and not exceed 1.")
     return result.copy()
+
+
+def _fine_cr_amplitude_range(center_amplitude: float) -> NDArray[np.float64]:
+    """Return the default 17-point ±8% fine CR amplitude sweep."""
+    center = _as_positive_float(center_amplitude, name="fine center cr_amplitude")
+    values = np.unique(np.clip(center * _FINE_CR_SWEEP_FACTORS, 0.0, 1.0))
+    if values.size < 2:
+        raise ValueError("Fine CR amplitude range must contain at least two points.")
+    return values
+
+
+def _expand_sweep_toward_root(
+    values: NDArray[np.float64],
+    *,
+    center: float,
+    root: float,
+    bounds: tuple[float, float] | None,
+) -> NDArray[np.float64]:
+    """Extend one side of a sweep to twice its original distance from center."""
+    center = _as_finite_float(center, name="sweep center")
+    root = _as_finite_float(root, name="fitted root")
+    if values.size < 2:
+        raise ValueError("A sweep must contain at least two points before expansion.")
+    differences = np.diff(values)
+    if np.any(differences <= 0.0):
+        raise ValueError("A sweep must be strictly increasing before expansion.")
+    step = float(np.min(differences))
+    lower = float(values[0])
+    upper = float(values[-1])
+    if root < lower:
+        span = center - lower
+        if span <= 0.0:
+            raise ValueError(
+                "Cannot extend a sweep whose center is not above its lower end."
+            )
+        limit = center - _MAX_SWEEP_EXPANSION_FACTOR * span
+        if bounds is not None:
+            limit = max(limit, bounds[0])
+        extension = lower - limit
+        count = int(np.ceil(extension / step - _NUMERIC_TOLERANCE))
+        extra = np.linspace(limit, lower, count + 1, dtype=np.float64)[:-1]
+        expanded = np.concatenate((extra, values))
+    elif root > upper:
+        span = upper - center
+        if span <= 0.0:
+            raise ValueError(
+                "Cannot extend a sweep whose center is not below its upper end."
+            )
+        limit = center + _MAX_SWEEP_EXPANSION_FACTOR * span
+        if bounds is not None:
+            limit = min(limit, bounds[1])
+        extension = limit - upper
+        count = int(np.ceil(extension / step - _NUMERIC_TOLERANCE))
+        extra = np.linspace(upper, limit, count + 1, dtype=np.float64)[1:]
+        expanded = np.concatenate((values, extra))
+    else:
+        return values.copy()
+    expanded = np.unique(expanded)
+    if expanded.size == values.size:
+        raise ValueError("The fitted root is outside the maximum sweep range.")
+    return expanded
+
+
+def _default_cancel_offsets(
+    exp: Experiment,
+    target_qubit: str,
+    *,
+    cr_half_duration: float,
+    cr_ramptime: float,
+    error_amplification_n: int,
+) -> NDArray[np.float64]:
+    """Resolve cancellation offsets giving 0.2/N radians per gate at each edge."""
+    repetitions = _as_positive_integer(
+        error_amplification_n, name="error_amplification_n"
+    )
+    effective_duration = _as_positive_float(
+        cr_half_duration - cr_ramptime,
+        name="cancellation effective duration",
+    )
+    exp.pulse.validate_rabi_params([target_qubit])
+    edge_rabi_rate = _DEFAULT_CANCEL_EDGE_ROTATION / (
+        2.0 * np.pi * repetitions * effective_duration
+    )
+    edge_offset = abs(
+        _as_finite_float(
+            exp.pulse.calc_control_amplitude(target_qubit, edge_rabi_rate),
+            name="cancellation edge offset",
+        )
+    )
+    if edge_offset == 0.0:
+        raise ValueError(
+            "The target Rabi parameters produced a zero cancellation range."
+        )
+    return np.linspace(
+        -edge_offset,
+        edge_offset,
+        _DEFAULT_CANCEL_SWEEP_POINTS,
+    )
 
 
 def _resolve_offsets(
     values: ArrayLike | None,
     *,
-    default: NDArray[np.float64],
+    default: NDArray[np.float64] | None,
     name: str,
 ) -> NDArray[np.float64]:
-    result = default.copy() if values is None else _as_finite_vector(values, name=name)
+    if values is None:
+        if default is None:
+            raise RuntimeError(f"Default {name} could not be resolved.")
+        result = default.copy()
+    else:
+        result = _as_finite_vector(values, name=name)
     if result.size < 2:
         raise ValueError(f"{name} must contain at least two points.")
     if np.any(np.diff(result) <= 0.0):
@@ -1302,6 +1494,54 @@ def _stage_measurement_data(measurement: _StageMeasurement) -> dict[str, Any]:
     }
 
 
+def _fit_measurement_data(
+    measurement: _StageMeasurement,
+    analysis: _ZeroCrossingAnalysis,
+) -> dict[str, Any]:
+    """Return one measured sweep and its linear-fit metadata."""
+    return {
+        **_stage_measurement_data(measurement),
+        "root": analysis.root,
+        "root_bracket": analysis.root_bracket,
+        "fit_slope": analysis.fit_slope,
+        "fit_intercept": analysis.fit_intercept,
+        "fitted_signal": analysis.fitted_signal.copy(),
+        "fit_quality": _fit_quality(analysis),
+    }
+
+
+def _plot_stage_fit(
+    measurement: _StageMeasurement,
+    analysis: _ZeroCrossingAnalysis,
+    *,
+    stage: _Stage,
+) -> None:
+    """Show one CR calibration signal together with its fitted line."""
+    figure = go.Figure()
+    figure.add_trace(
+        go.Scatter(
+            x=measurement.sweep_values,
+            y=measurement.error_signal,
+            mode="markers",
+            name="Measurement",
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=measurement.sweep_values,
+            y=analysis.fitted_signal,
+            mode="lines",
+            name="Linear fit",
+        )
+    )
+    figure.update_layout(
+        title=f"SRRE-CR {stage.upper()} calibration",
+        xaxis_title=_stage_parameter_name(stage),
+        yaxis_title=f"S_{stage.upper()}",
+    )
+    figure.show()
+
+
 def _empty_measurement_data() -> dict[str, Any]:
     return {
         "sweep_values": np.array([], dtype=np.float64),
@@ -1317,7 +1557,9 @@ def _failed_stage_data(
     input_params: Mapping[str, Any],
     configuration: Mapping[str, bool],
     measurement: _StageMeasurement | None,
+    analysis: _ZeroCrossingAnalysis | None,
     reason: str,
+    fit_history: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     data = (
         _empty_measurement_data()
@@ -1329,10 +1571,13 @@ def _failed_stage_data(
         "input_params": dict(input_params),
         "proposed_params": None,
         "accepted_params": dict(input_params),
-        "root": None,
-        "root_bracket": None,
-        "fit_slope": None,
-        "fit_quality": None,
+        "root": None if analysis is None else analysis.root,
+        "root_bracket": None if analysis is None else analysis.root_bracket,
+        "fit_slope": None if analysis is None else analysis.fit_slope,
+        "fit_intercept": None if analysis is None else analysis.fit_intercept,
+        "fitted_signal": (None if analysis is None else analysis.fitted_signal.copy()),
+        "fit_history": [] if fit_history is None else fit_history,
+        "fit_quality": None if analysis is None else _fit_quality(analysis),
         "verification": None,
         "configuration": dict(configuration),
         "converged": False,
@@ -1353,6 +1598,7 @@ def _failed_verification_run(
     verification: _StageMeasurement | None = None,
     current_signal: float | None = None,
     candidate_signal: float | None = None,
+    fit_history: list[dict[str, Any]] | None = None,
 ) -> _StageRun:
     verification_data: dict[str, Any] = (
         {"status": "failed", "reason": reason}
@@ -1381,6 +1627,9 @@ def _failed_verification_run(
             "root": analysis.root,
             "root_bracket": analysis.root_bracket,
             "fit_slope": analysis.fit_slope,
+            "fit_intercept": analysis.fit_intercept,
+            "fitted_signal": analysis.fitted_signal.copy(),
+            "fit_history": [] if fit_history is None else fit_history,
             "fit_quality": _fit_quality(analysis),
             "verification": verification_data,
             "configuration": dict(configuration),
@@ -1522,6 +1771,9 @@ def _fill_skipped_stages(round_data: dict[str, Any], *, after: str) -> None:
             "root": None,
             "root_bracket": None,
             "fit_slope": None,
+            "fit_intercept": None,
+            "fitted_signal": None,
+            "fit_history": [],
             "fit_quality": None,
             "verification": None,
             "configuration": None,
@@ -1648,3 +1900,11 @@ def _resolve_optional_positive_float(
     name: str,
 ) -> float:
     return default if value is None else _as_positive_float(value, name=name)
+
+
+def _context_shot_interval(exp: Experiment) -> float:
+    """Resolve the configured shot interval for the current experiment context."""
+    experiment_system = getattr(exp.ctx, "experiment_system", None)
+    configured_defaults = getattr(experiment_system, "measurement_defaults", None)
+    defaults = resolve_measurement_defaults(configured_defaults)
+    return float(defaults.execution.shot_interval_ns)

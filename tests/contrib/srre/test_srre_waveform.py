@@ -143,6 +143,22 @@ def test_calculate_srre_moments_preserves_symmetry_and_lobe_area() -> None:
     assert np.isfinite(moments.f0.imag)
 
 
+def test_negative_lobe_moments_remain_finite_and_symmetric() -> None:
+    """Negative SRRE angles should keep both moments finite and F1 near zero."""
+    moments = calculate_srre_moments(
+        block_duration=64.0,
+        ramp_time=8.0,
+        amplitude=0.8,
+        rabi_rate_from_amplitude=lambda amplitude: 0.08 * amplitude,
+        sampling_period=1.0,
+    )
+
+    assert np.isfinite(
+        [moments.f0.real, moments.f0.imag, moments.f1.real, moments.f1.imag]
+    ).all()
+    assert moments.f1 == pytest.approx(0.0j, abs=1e-14)
+
+
 def test_calculate_srre_moments_integrates_piecewise_constant_samples() -> None:
     """Moment calculation should integrate each constant AWG sample exactly."""
     rabi_rate = 0.05

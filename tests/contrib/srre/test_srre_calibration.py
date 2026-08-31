@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 from numpy.testing import assert_allclose
 
+import qubex.contrib.experiment.srre_calibration as calibration_module
 from qubex.contrib import calibrate_srre
 from qubex.contrib.experiment.srre_calibration import (
     _analyze_zero_crossing,
@@ -83,10 +84,19 @@ class _MeasurementService:
 
 
 class _Experiment:
-    def __init__(self, *, target: str = "Q00", root: float = 0.52) -> None:
+    def __init__(
+        self,
+        *,
+        target: str = "Q00",
+        root: float = 0.52,
+        shot_interval: float = 153600.0,
+    ) -> None:
         self.pulse = _PulseService()
         self.measurement_service = _MeasurementService(target=target, root=root)
         self.ctx = SimpleNamespace(
+            experiment_system=SimpleNamespace(
+                measurement_defaults={"execution": {"shot_interval_ns": shot_interval}}
+            ),
             measurement=SimpleNamespace(sampling_period=1.0),
             util=SimpleNamespace(resolve_sampling_period=float),
         )
@@ -102,12 +112,12 @@ def test_zero_crossing_recovers_known_root_from_differential_signal() -> None:
         amplitudes=amplitudes,
         signal_plus=signal_plus,
         signal_minus=signal_minus,
-        predicted_amplitude=0.5,
     )
 
     assert analysis.root == pytest.approx(0.53, abs=1e-14)
-    assert analysis.root_bracket == pytest.approx((0.5, 0.6), abs=1e-14)
+    assert analysis.root_bracket == pytest.approx((0.4, 0.6), abs=1e-14)
     assert analysis.fit_slope == pytest.approx(3.0, abs=1e-14)
+    assert analysis.fit_intercept == pytest.approx(-1.59, abs=1e-14)
     assert_allclose(
         analysis.differential_signal,
         3.0 * (amplitudes - 0.53),
@@ -116,20 +126,34 @@ def test_zero_crossing_recovers_known_root_from_differential_signal() -> None:
     )
 
 
-def test_zero_crossing_selects_bracket_closest_to_prediction() -> None:
-    """Multiple crossings should select the root nearest the prediction."""
-    amplitudes = np.array([0.2, 0.4, 0.6, 0.8])
-    differential = np.array([-1.0, 1.0, -1.0, 1.0])
+def test_zero_crossing_fits_all_sweep_points() -> None:
+    """The calibrated root should come from one line fitted to every point."""
+    amplitudes = np.linspace(0.46, 0.54, 17)
+    differential = 2.5 * (amplitudes - 0.513)
+    differential[::2] += 1e-4
+    differential[1::2] -= 1e-4
 
     analysis = _analyze_zero_crossing(
         amplitudes=amplitudes,
         signal_plus=differential,
         signal_minus=-differential,
-        predicted_amplitude=0.68,
     )
 
-    assert analysis.root == pytest.approx(0.7, abs=1e-14)
-    assert analysis.root_bracket == pytest.approx((0.6, 0.8), abs=1e-14)
+    centered_amplitudes = amplitudes - np.mean(amplitudes)
+    expected_slope = np.dot(
+        centered_amplitudes,
+        differential - np.mean(differential),
+    ) / np.dot(centered_amplitudes, centered_amplitudes)
+    expected_intercept = np.mean(differential) - expected_slope * np.mean(amplitudes)
+    assert analysis.root == pytest.approx(
+        -expected_intercept / expected_slope, abs=1e-14
+    )
+    assert_allclose(
+        analysis.fitted_signal,
+        expected_slope * amplitudes + expected_intercept,
+        rtol=0.0,
+        atol=1e-14,
+    )
 
 
 def test_zero_crossing_rejects_trivial_zero_amplitude_root() -> None:
@@ -139,14 +163,13 @@ def test_zero_crossing_rejects_trivial_zero_amplitude_root() -> None:
             amplitudes=[0.0, 0.1, 0.2],
             signal_plus=[0.0, 0.1, 0.2],
             signal_minus=[0.0, -0.1, -0.2],
-            predicted_amplitude=0.5,
         )
 
 
 @pytest.mark.parametrize(
     ("signal_plus", "signal_minus", "message"),
     [
-        ([1.0, 2.0, 3.0], [0.0, 0.0, 0.0], "does not bracket"),
+        ([1.0, 2.0, 3.0], [0.0, 0.0, 0.0], "outside"),
         ([-1e-12, 1e-12, 2e-12], [0.0, 0.0, 0.0], "slope is too small"),
         ([-1.0, np.nan, 1.0], [0.0, 0.0, 0.0], "finite"),
     ],
@@ -162,7 +185,6 @@ def test_zero_crossing_rejects_unsafe_signal_data(
             amplitudes=np.array([0.4, 0.5, 0.6]),
             signal_plus=np.asarray(signal_plus),
             signal_minus=np.asarray(signal_minus),
-            predicted_amplitude=0.5,
         )
 
 
@@ -173,7 +195,6 @@ def test_zero_crossing_rejects_complex_signal_data() -> None:
             amplitudes=[0.4, 0.5, 0.6],
             signal_plus=np.array([-1.0 + 0.1j, 0.0, 1.0]),
             signal_minus=[0.0, 0.0, 0.0],
-            predicted_amplitude=0.5,
         )
 
 
@@ -209,6 +230,25 @@ def test_sequence_rejects_reference_pulses_on_a_different_sampling_grid() -> Non
     pulse = _PulseService(sampling_period=2.0)
 
     with pytest.raises(ValueError, match="sampling period"):
+        _build_srre_calibration_sequence(
+            cast(Any, SimpleNamespace(pulse=pulse)),
+            "Q00",
+            block_duration=200.0,
+            ramp_time=0.0,
+            amplitude=0.5,
+            detuning=0.001,
+            repetitions=1,
+            analysis_angle=np.pi / 2,
+            sampling_period=1.0,
+        )
+
+
+def test_sequence_rejects_a_non_waveform_reference_pulse() -> None:
+    """Calibration references should fail clearly when a pulse service is invalid."""
+    pulse = _PulseService()
+    pulse.y90 = lambda _target: object()  # type: ignore[method-assign]
+
+    with pytest.raises(TypeError, match="preparation pulse must be a Waveform"):
         _build_srre_calibration_sequence(
             cast(Any, SimpleNamespace(pulse=pulse)),
             "Q00",
@@ -274,7 +314,7 @@ def test_calibrate_srre_interleaves_detuning_and_returns_data_contract() -> None
     assert calibration["repetitions"] == 2
     assert calibration["f0_predicted"] == pytest.approx(0.0j, abs=1e-10)
     assert calibration["f1_predicted"] == pytest.approx(0.0j, abs=1e-14)
-    assert calibration["root_bracket"] == pytest.approx((0.5, 0.55), abs=1e-12)
+    assert calibration["root_bracket"] == pytest.approx((0.45, 0.55), abs=1e-12)
     assert calibration["fit_slope"] == pytest.approx(1.0, abs=1e-12)
     assert_allclose(calibration["amplitude_range"], amplitude_range)
     assert_allclose(calibration["signal_plus"], amplitude_range - 0.52)
@@ -316,11 +356,11 @@ def test_calibrate_srre_detaches_returned_amplitude_range_from_caller() -> None:
     assert_allclose(calibration["amplitude_range"], [0.45, 0.50, 0.55])
 
 
-def test_calibrate_srre_does_not_return_fallback_without_a_bracket() -> None:
-    """Calibration should fail rather than adopt a fallback amplitude."""
+def test_calibrate_srre_rejects_a_fitted_root_outside_the_sweep() -> None:
+    """Calibration should fail rather than extrapolate beyond the measured sweep."""
     exp = _Experiment(root=0.9)
 
-    with pytest.raises(ValueError, match="does not bracket"):
+    with pytest.raises(ValueError, match="outside"):
         calibrate_srre(
             cast(Any, exp),
             "Q00",
@@ -329,6 +369,51 @@ def test_calibrate_srre_does_not_return_fallback_without_a_bracket() -> None:
             amplitude_range=[0.45, 0.50, 0.55],
             plot=False,
         )
+
+
+def test_calibrate_srre_uses_new_defaults_and_context_interval() -> None:
+    """Default calibration should use 17 points, four blocks, and context timing."""
+    exp = _Experiment(root=0.52, shot_interval=4096.0)
+
+    result = calibrate_srre(
+        cast(Any, exp),
+        "Q00",
+        block_duration=200.0,
+        ramp_time=0.0,
+        plot=False,
+    )
+
+    calibration = cast(dict[str, Any], result.data["srre_calibration"])
+    expected_range = 0.5 * np.linspace(0.92, 1.08, 17)
+    assert_allclose(calibration["amplitude_range"], expected_range)
+    assert calibration["repetitions"] == 4
+    assert calibration["probe_detuning"] == pytest.approx(1.0 / 3200.0)
+    assert exp.measurement_service.calls[0]["shot_interval"] == pytest.approx(4096.0)
+
+
+def test_calibrate_srre_plots_differential_signal_and_fit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Plotting should show differential measurements and their fitted line."""
+    shown: list[Any] = []
+    monkeypatch.setattr(
+        calibration_module.go.Figure,
+        "show",
+        lambda figure: shown.append(figure),
+    )
+
+    calibrate_srre(
+        cast(Any, _Experiment(root=0.52)),
+        "Q00",
+        block_duration=200.0,
+        ramp_time=0.0,
+        plot=True,
+    )
+
+    assert len(shown) == 1
+    assert [trace.name for trace in shown[0].data] == ["Measurement", "Linear fit"]
+    assert shown[0].layout.xaxis.title.text == "SRRE amplitude"
+    assert shown[0].layout.yaxis.title.text == "Differential signal"
 
 
 @pytest.mark.parametrize(
