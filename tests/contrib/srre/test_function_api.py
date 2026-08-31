@@ -42,10 +42,11 @@ def test_all_srre_functions_are_exported_from_experiment() -> None:
     assert experiment_calibrate_srre_zx90 is calibrate_srre_zx90
 
 
-def test_calibrate_srre_zx90_public_signature_uses_fine_rounds() -> None:
-    """The public API should expose fixed rounds and no verification controls."""
+def test_calibrate_srre_zx90_public_signature_defaults() -> None:
+    """The public API should expose fixed rounds and phase tracking by default."""
     parameters = signature(calibrate_srre_zx90).parameters
 
     assert parameters["fine_rounds"].default == 1
+    assert parameters["rotate_cancellation_with_cr_phase"].default is True
     assert "max_fine_rounds" not in parameters
     assert "verification_n_shots" not in parameters

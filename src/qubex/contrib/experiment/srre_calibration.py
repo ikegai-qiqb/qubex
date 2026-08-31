@@ -95,7 +95,10 @@ def calibrate_srre(
     Result
         Result whose `data["srre_calibration"]` contains the accepted and
         predicted amplitudes, waveform geometry, probe settings, fitted line,
-        measured differential signals, and the raw sweep result.
+        measured differential signals, and the raw sweep result. `rabi_rate`
+        is evaluated at the measured root. `positive_lobe_angle`, `phi_pred`,
+        `f0_predicted`, and `f1_predicted` describe the model root used to set
+        the fixed analysis axis.
 
     Raises
     ------

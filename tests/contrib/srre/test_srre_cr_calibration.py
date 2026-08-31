@@ -13,6 +13,7 @@ from numpy.testing import assert_allclose
 import qubex.contrib.experiment.srre_cr_calibration as calibration_module
 from qubex.contrib import calibrate_srre_zx90
 from qubex.contrib.experiment.srre_cr_calibration import (
+    _apply_stage_candidate,
     _build_stage_sequence,
     _calculate_ix_signal,
     _calculate_iy_signal,
@@ -33,6 +34,61 @@ from qubex.pulse import Arbitrary, PulseSchedule
 CONTROL = "Q00"
 TARGET = "Q01"
 SAMPLING_PERIOD = 1.0
+
+
+@pytest.mark.parametrize("scale_cancellation_with_cr", [True, False])
+def test_zy_candidate_preserves_cr_cancellation_relative_phase(
+    scale_cancellation_with_cr: bool,
+) -> None:
+    """A CR phase update should rotate cancellation IQ by the same amount."""
+    initial_phase = 0.2
+    candidate_phase = -0.15
+    initial_cancellation = 0.1 - 0.05j
+
+    updated = _apply_stage_candidate(
+        {
+            "cr_amplitude": 0.4,
+            "cr_phase": initial_phase,
+            "cancel_x": initial_cancellation.real,
+            "cancel_y": initial_cancellation.imag,
+        },
+        stage="zy",
+        candidate=candidate_phase,
+        scale_cancellation_with_cr=scale_cancellation_with_cr,
+        rotate_cancellation_with_cr_phase=True,
+    )
+
+    updated_cancellation = complex(updated["cancel_x"], updated["cancel_y"])
+    expected = initial_cancellation * np.exp(1j * (candidate_phase - initial_phase))
+    assert updated["cr_phase"] == pytest.approx(candidate_phase)
+    assert updated_cancellation == pytest.approx(expected)
+    assert abs(updated_cancellation) == pytest.approx(abs(initial_cancellation))
+    assert np.angle(updated_cancellation * np.exp(-1j * candidate_phase)) == (
+        pytest.approx(np.angle(initial_cancellation * np.exp(-1j * initial_phase)))
+    )
+
+
+def test_zy_candidate_can_leave_cancellation_phase_fixed() -> None:
+    """Phase tracking can be disabled independently of amplitude scaling."""
+    initial_cancellation = 0.1 - 0.05j
+
+    updated = _apply_stage_candidate(
+        {
+            "cr_amplitude": 0.4,
+            "cr_phase": 0.2,
+            "cancel_x": initial_cancellation.real,
+            "cancel_y": initial_cancellation.imag,
+        },
+        stage="zy",
+        candidate=-0.15,
+        scale_cancellation_with_cr=True,
+        rotate_cancellation_with_cr_phase=False,
+    )
+
+    assert updated["cr_phase"] == pytest.approx(-0.15)
+    assert complex(updated["cancel_x"], updated["cancel_y"]) == pytest.approx(
+        initial_cancellation
+    )
 
 
 class _CalibrationNote:
@@ -651,6 +707,7 @@ def test_measure_stage_collects_the_four_states_and_calculates_error_signal(
         sweep_values=values,
         error_amplification_n=2,
         scale_cancellation_with_cr=True,
+        rotate_cancellation_with_cr_phase=True,
         n_shots=128,
         shot_interval=1024.0,
     )
@@ -731,6 +788,7 @@ def test_valid_root_is_accepted_without_fresh_verification(
         sweep_values=[0.3, 0.5],
         error_amplification_n=1,
         scale_cancellation_with_cr=True,
+        rotate_cancellation_with_cr_phase=True,
         n_shots=128,
         shot_interval=1024.0,
         plot=False,
@@ -777,6 +835,7 @@ def test_zx_stage_rejects_a_nonpositive_root(
         sweep_values=[0.0, 0.1],
         error_amplification_n=1,
         scale_cancellation_with_cr=True,
+        rotate_cancellation_with_cr_phase=True,
         n_shots=128,
         shot_interval=1024.0,
         plot=False,
@@ -824,6 +883,7 @@ def test_cancel_stage_retries_around_root_without_remeasuring_overlap(
         sweep_values=[-0.1, 0.0, 0.1],
         error_amplification_n=1,
         scale_cancellation_with_cr=True,
+        rotate_cancellation_with_cr_phase=True,
         n_shots=128,
         shot_interval=1024.0,
         plot=False,
@@ -872,6 +932,7 @@ def test_cr_stage_retries_on_same_width_grid_without_remeasuring_overlap(
         sweep_values=0.5 * np.linspace(0.84, 1.16, 17),
         error_amplification_n=1,
         scale_cancellation_with_cr=True,
+        rotate_cancellation_with_cr_phase=True,
         n_shots=128,
         shot_interval=1024.0,
         plot=False,
@@ -925,6 +986,7 @@ def test_phase_stage_retries_around_root_without_remeasuring_overlap(
         sweep_values=0.2 + np.linspace(-0.16, 0.16, 17),
         error_amplification_n=1,
         scale_cancellation_with_cr=True,
+        rotate_cancellation_with_cr_phase=True,
         n_shots=128,
         shot_interval=1024.0,
         plot=False,
@@ -1032,6 +1094,7 @@ def test_stage_plot_contains_measurements_and_linear_fit(
         sweep_values=[0.0, 0.1, 0.2],
         error_amplification_n=1,
         scale_cancellation_with_cr=True,
+        rotate_cancellation_with_cr_phase=True,
         n_shots=128,
         shot_interval=1024.0,
         plot=True,
@@ -1208,6 +1271,7 @@ def test_calibrate_srre_zx90_orchestrates_all_stages_and_returns_contract(
     assert calibration["srre_calibration"]["amplitude"] == 0.3
     assert calibration["requested_fine_rounds"] == 1
     assert calibration["completed_fine_rounds"] == 1
+    assert calibration["rotate_cancellation_with_cr_phase"] is True
     assert calibration["coherence_limit"] == {}
     assert len(calibration["fine_rounds"]) == 1
     assert "final_verification" not in calibration
@@ -1252,6 +1316,50 @@ def test_calibrate_srre_zx90_orchestrates_all_stages_and_returns_contract(
         else:
             assert srre_calibration[key] == expected
     assert exp.note.cr_param["cr_amplitude"] == 0.4
+
+
+def test_public_workflow_can_disable_cancellation_phase_tracking(
+    monkeypatch: pytest.MonkeyPatch,
+    srre_calibration: dict[str, Any],
+) -> None:
+    """The public phase-tracking option should reach every measured stage."""
+    tracking_options: list[bool] = []
+
+    def fake_measure_stage(**kwargs: Any) -> Any:
+        values = np.asarray(kwargs["sweep_values"], dtype=float)
+        stage = kwargs["stage"]
+        tracking_options.append(kwargs["rotate_cancellation_with_cr_phase"])
+        root = float(values.mean() + (0.05 if stage == "zy" else 0.0))
+        return _mock_stage_measurement(
+            sweep_values=values,
+            stage=stage,
+            root=root,
+        )
+
+    monkeypatch.setattr(calibration_module, "_measure_stage", fake_measure_stage)
+    result = calibrate_srre_zx90(
+        cast(Any, _Experiment()),
+        CONTROL,
+        TARGET,
+        cr_half_duration=192.0,
+        srre_ramp_time=20.0,
+        srre_calibration=srre_calibration,
+        cr_amplitude_range=[0.3, 0.4, 0.5],
+        cr_phase_offsets=[-0.1, 0.0, 0.1],
+        cancel_y_offsets=[-0.1, 0.0, 0.1],
+        cancel_x_offsets=[-0.1, 0.0, 0.1],
+        rotate_cancellation_with_cr_phase=False,
+        plot=False,
+    )
+
+    calibration = cast(dict[str, Any], result.data["srre_cr_calibration"])
+    phase_params = calibration["fine_rounds"][0]["phase_stage"]["accepted_params"]
+    assert tracking_options
+    assert not any(tracking_options)
+    assert calibration["rotate_cancellation_with_cr_phase"] is False
+    assert phase_params["cr_phase"] == pytest.approx(0.25, abs=1e-15)
+    assert phase_params["cancel_x"] == pytest.approx(0.1, abs=1e-15)
+    assert phase_params["cancel_y"] == pytest.approx(-0.05, abs=1e-15)
 
 
 def test_calibration_runs_exactly_the_requested_number_of_fine_rounds(
@@ -1432,6 +1540,23 @@ def test_fine_rounds_must_be_a_positive_integer(
             srre_ramp_time=20.0,
             srre_calibration=srre_calibration,
             fine_rounds=fine_rounds,
+            plot=False,
+        )
+
+
+def test_phase_tracking_option_must_be_boolean(
+    srre_calibration: dict[str, Any],
+) -> None:
+    """The cancellation phase-tracking option should reject non-booleans."""
+    with pytest.raises(TypeError, match="rotate_cancellation_with_cr_phase"):
+        calibrate_srre_zx90(
+            cast(Any, _Experiment()),
+            CONTROL,
+            TARGET,
+            cr_half_duration=192.0,
+            srre_ramp_time=20.0,
+            srre_calibration=srre_calibration,
+            rotate_cancellation_with_cr_phase=cast(Any, 1),
             plot=False,
         )
 

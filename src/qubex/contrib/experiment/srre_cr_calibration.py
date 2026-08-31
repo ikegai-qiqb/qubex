@@ -122,6 +122,7 @@ def calibrate_srre_zx90(
     error_amplification_n: int = 1,
     fine_rounds: int = 1,
     scale_cancellation_with_cr: bool = True,
+    rotate_cancellation_with_cr_phase: bool = True,
     n_shots: int | None = None,
     shot_interval: float | None = None,
     plot: bool = True,
@@ -159,32 +160,39 @@ def calibrate_srre_zx90(
         Positive one-qubit SRRE probe detuning in GHz.
     cr_amplitude_range : ArrayLike | None, optional
         Strictly increasing positive absolute CR amplitudes not exceeding one
-        for stages 8 and 11. When omitted, 17 points spanning +/-16% around
-        the ZX90 amplitude predicted for the fixed CR-half duration are used.
-        If the fitted root is outside the measured range, one equally wide
-        retry range with the same grid spacing is centered on the extrapolated
-        root. Previously measured points in the overlapping interval are reused.
+        for the initial and final ZX stages. When omitted, 17 points spanning
+        ±16% around the ZX90 amplitude predicted for the fixed CR-half duration
+        are used. If the fitted root is outside the measured range, one equally
+        wide retry range with the same spacing pattern is centered on the
+        extrapolated root. Previously measured points in the overlapping
+        interval are reused.
     cr_phase_offsets : ArrayLike | None, optional
-        Strictly increasing phase offsets in radians for stage 9a. Defaults to
-        17 points spanning +/-0.16 rad. If the fitted root lies outside the
+        Strictly increasing phase offsets in radians for the ZY stage. Defaults
+        to 17 points spanning ±0.16 rad. If the fitted root lies outside the
         measured range, one retry range is centered on the extrapolated root;
-        its width and grid spacing match the first range, and overlapping data
-        are reused.
+        its width and spacing pattern match the first range, and overlapping
+        data are reused.
     cancel_y_offsets : ArrayLike | None, optional
-        Strictly increasing cancellation-Y offsets for stage 9b. By default,
+        Strictly increasing cancellation-Y offsets for the IY stage. By default,
         target Rabi parameters set 17 symmetric points whose sweep edges rotate
         by `0.16 / N` rad in one candidate gate. An out-of-range root triggers
         the same root-centered retry as the CR sweep.
     cancel_x_offsets : ArrayLike | None, optional
-        Strictly increasing cancellation-X offsets for stage 9c. Its default is
-        resolved and retried in the same way as `cancel_y_offsets`.
+        Strictly increasing cancellation-X offsets for the IX stage. Its
+        default is resolved and retried in the same way as `cancel_y_offsets`.
     error_amplification_n : int, optional
         Positive `N`; fine-stage sequences contain exactly `2N` cycles.
     fine_rounds : int, optional
         Positive number of phase/cancellation/final-angle rounds to run. The
         default is one. Each round runs ZY, IY, IX, then ZX in that order.
     scale_cancellation_with_cr : bool, optional
-        Whether accepted cancellation IQ scales with CR amplitude candidates.
+        Whether cancellation IQ scales by the CR candidate/current amplitude
+        ratio during ZX sweeps and accepted updates. Defaults to `True`.
+    rotate_cancellation_with_cr_phase : bool, optional
+        Whether cancellation IQ rotates by the CR candidate/current phase
+        difference during ZY sweeps and accepted updates. Defaults to `True`,
+        preserving the relative phase between the CR and cancellation tones.
+        If `False`, only CR phase changes during the ZY stage.
     n_shots : int | None, optional
         Shots per four-state sweep point. Defaults to calibration shots.
     shot_interval : float | None, optional
@@ -203,7 +211,8 @@ def calibrate_srre_zx90(
         failure; the failing stage carries its reason. `requested_fine_rounds`
         and `completed_fine_rounds` report the requested and fully completed
         counts. A completed result also contains the SRRE ZX90 coherence limit
-        when T1 and echo-T2 parameters are available.
+        when T1 and echo-T2 parameters are available. The two cancellation
+        tracking options are retained in the returned calibration mapping.
 
     Raises
     ------
@@ -231,9 +240,12 @@ def calibrate_srre_zx90(
     fine_rounds = _as_positive_integer(fine_rounds, name="fine_rounds")
     if not isinstance(scale_cancellation_with_cr, (bool, np.bool_)):
         raise TypeError("scale_cancellation_with_cr must be a boolean.")
+    if not isinstance(rotate_cancellation_with_cr_phase, (bool, np.bool_)):
+        raise TypeError("rotate_cancellation_with_cr_phase must be a boolean.")
     if not isinstance(plot, (bool, np.bool_)):
         raise TypeError("plot must be a boolean.")
     scale_cancellation_with_cr = bool(scale_cancellation_with_cr)
+    rotate_cancellation_with_cr_phase = bool(rotate_cancellation_with_cr_phase)
     plot = bool(plot)
     resolved_shots = _resolve_optional_positive_integer(
         n_shots,
@@ -309,6 +321,7 @@ def calibrate_srre_zx90(
         cr_half_duration=duration_resolution.resolved_duration,
         srre_calibration=srre_data,
         scale_cancellation_with_cr=scale_cancellation_with_cr,
+        rotate_cancellation_with_cr_phase=rotate_cancellation_with_cr_phase,
     )
 
     initial_angle = _run_parameter_stage(
@@ -320,6 +333,7 @@ def calibrate_srre_zx90(
         sweep_values=amplitude_values,
         error_amplification_n=error_amplification_n,
         scale_cancellation_with_cr=scale_cancellation_with_cr,
+        rotate_cancellation_with_cr_phase=rotate_cancellation_with_cr_phase,
         n_shots=resolved_shots,
         shot_interval=resolved_interval,
         plot=plot,
@@ -342,6 +356,7 @@ def calibrate_srre_zx90(
                 fine_offsets=fine_offsets,
                 error_amplification_n=error_amplification_n,
                 scale_cancellation_with_cr=scale_cancellation_with_cr,
+                rotate_cancellation_with_cr_phase=rotate_cancellation_with_cr_phase,
                 n_shots=resolved_shots,
                 shot_interval=resolved_interval,
                 plot=plot,
@@ -687,6 +702,7 @@ def _measure_stage(
     sweep_values: ArrayLike,
     error_amplification_n: int,
     scale_cancellation_with_cr: bool,
+    rotate_cancellation_with_cr_phase: bool,
     n_shots: int,
     shot_interval: float,
 ) -> _StageMeasurement:
@@ -711,6 +727,7 @@ def _measure_stage(
                 stage=stage,
                 candidate=float(candidate),
                 scale_cancellation_with_cr=scale_cancellation_with_cr,
+                rotate_cancellation_with_cr_phase=rotate_cancellation_with_cr_phase,
             )
             return _build_stage_sequence(
                 exp,
@@ -789,6 +806,7 @@ def _measure_fitted_stage(
     sweep_values: ArrayLike,
     error_amplification_n: int,
     scale_cancellation_with_cr: bool,
+    rotate_cancellation_with_cr_phase: bool,
     n_shots: int,
     shot_interval: float,
     plot: bool,
@@ -814,6 +832,7 @@ def _measure_fitted_stage(
         scale_cancellation_with_cr=scale_cancellation_with_cr,
         n_shots=n_shots,
         shot_interval=shot_interval,
+        rotate_cancellation_with_cr_phase=rotate_cancellation_with_cr_phase,
     )
     initial_analysis = _fit_zero_crossing(
         sweep_values=initial_measurement.sweep_values,
@@ -854,6 +873,7 @@ def _measure_fitted_stage(
             scale_cancellation_with_cr=scale_cancellation_with_cr,
             n_shots=n_shots,
             shot_interval=shot_interval,
+            rotate_cancellation_with_cr_phase=rotate_cancellation_with_cr_phase,
         )
     )
     retry_measurement = _assemble_retry_measurement(
@@ -883,6 +903,7 @@ def _run_parameter_stage(
     sweep_values: ArrayLike,
     error_amplification_n: int,
     scale_cancellation_with_cr: bool,
+    rotate_cancellation_with_cr_phase: bool,
     n_shots: int,
     shot_interval: float,
     plot: bool,
@@ -909,6 +930,7 @@ def _run_parameter_stage(
             shot_interval=shot_interval,
             plot=plot,
             allow_root_centered_retry=allow_root_centered_retry,
+            rotate_cancellation_with_cr_phase=rotate_cancellation_with_cr_phase,
         )
         _require_root_in_measured_range(analysis)
         proposed = _apply_stage_candidate(
@@ -916,6 +938,7 @@ def _run_parameter_stage(
             stage=stage,
             candidate=_validated_stage_root(analysis.root, stage=stage),
             scale_cancellation_with_cr=scale_cancellation_with_cr,
+            rotate_cancellation_with_cr_phase=rotate_cancellation_with_cr_phase,
         )
     except (KeyError, RuntimeError, TypeError, ValueError) as exc:
         return _StageRun(
@@ -962,6 +985,7 @@ def _run_fine_round(
     fine_offsets: Mapping[_Stage, NDArray[np.float64]],
     error_amplification_n: int,
     scale_cancellation_with_cr: bool,
+    rotate_cancellation_with_cr_phase: bool,
     n_shots: int,
     shot_interval: float,
     plot: bool,
@@ -985,6 +1009,7 @@ def _run_fine_round(
             shot_interval=shot_interval,
             plot=plot,
             allow_root_centered_retry=True,
+            rotate_cancellation_with_cr_phase=rotate_cancellation_with_cr_phase,
         )
         round_data[data_key] = stage_run.data
         current = stage_run.accepted_calibration
@@ -1014,6 +1039,7 @@ def _run_fine_round(
         shot_interval=shot_interval,
         plot=plot,
         allow_root_centered_retry=True,
+        rotate_cancellation_with_cr_phase=rotate_cancellation_with_cr_phase,
     )
     round_data["final_angle_stage"] = final_angle.data
     current = final_angle.accepted_calibration
@@ -1192,6 +1218,7 @@ def _initial_calibration(
     cr_half_duration: float,
     srre_calibration: Mapping[str, Any],
     scale_cancellation_with_cr: bool,
+    rotate_cancellation_with_cr_phase: bool,
 ) -> dict[str, Any]:
     return {
         "control_qubit": control_qubit,
@@ -1207,6 +1234,7 @@ def _initial_calibration(
         "zx_rotation_rate": cr_parameters["zx_rotation_rate"],
         "srre_calibration": deepcopy(dict(srre_calibration)),
         "scale_cancellation_with_cr": scale_cancellation_with_cr,
+        "rotate_cancellation_with_cr_phase": rotate_cancellation_with_cr_phase,
     }
 
 
@@ -1216,6 +1244,7 @@ def _apply_stage_candidate(
     stage: _Stage,
     candidate: float,
     scale_cancellation_with_cr: bool,
+    rotate_cancellation_with_cr_phase: bool,
 ) -> dict[str, Any]:
     # Candidate application only replaces top-level scalar parameters. Keep
     # nested SRRE metadata and raw results shared instead of deep-copying them
@@ -1234,6 +1263,15 @@ def _apply_stage_candidate(
             result["cancel_y"] = float(result["cancel_y"] * scale)
         result["cr_amplitude"] = value
     elif stage == "zy":
+        if rotate_cancellation_with_cr_phase:
+            current_phase = _as_finite_float(
+                result["cr_phase"], name="current cr_phase"
+            )
+            phase_change = value - current_phase
+            cancellation = complex(result["cancel_x"], result["cancel_y"])
+            cancellation *= np.exp(1j * phase_change)
+            result["cancel_x"] = float(cancellation.real)
+            result["cancel_y"] = float(cancellation.imag)
         result["cr_phase"] = value
     elif stage == "iy":
         result["cancel_y"] = value
