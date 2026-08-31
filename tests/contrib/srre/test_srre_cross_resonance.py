@@ -143,9 +143,10 @@ def test_internal_builder_supports_all_calibration_configurations(
     expected_labels: list[str],
     expected_target: np.ndarray,
 ) -> None:
-    """Calibration builder should switch echo and SRRE independently."""
+    """Every configuration should contain two halves with the requested echo."""
+    exp = _Experiment()
     schedule = _build_srre_cross_resonance(
-        cast(Any, _Experiment()),
+        cast(Any, exp),
         CONTROL,
         TARGET,
         np.pi / 2,
@@ -169,7 +170,20 @@ def test_internal_builder_supports_all_calibration_configurations(
             atol=1e-15,
         )
     else:
-        assert sampled[TARGET].size == HALF_SAMPLES
+        assert sampled[TARGET].size == 2 * HALF_SAMPLES
+        assert_allclose(
+            sampled[TARGET][HALF_SAMPLES:],
+            expected_target,
+            rtol=0.0,
+            atol=1e-15,
+        )
+        assert_allclose(
+            sampled[CR_LABEL][:HALF_SAMPLES],
+            sampled[CR_LABEL][HALF_SAMPLES:],
+            rtol=0.0,
+            atol=1e-15,
+        )
+        assert exp.pulse.x180_calls == []
 
 
 @pytest.mark.parametrize("angle", [0.0, -np.pi / 4, np.pi / 4])
@@ -191,15 +205,17 @@ def test_angle_scales_cr_and_cancellation_but_not_srre(
     coefficient = angle / (np.pi / 2)
     expected_srre = np.r_[np.full(4, 0.3), np.full(4, -0.3)]
 
+    expected_cr_half = np.full(HALF_SAMPLES, 0.2j * coefficient)
+    expected_target_half = (0.1 - 0.05j) * coefficient + expected_srre
     assert_allclose(
         sampled[CR_LABEL],
-        np.full(HALF_SAMPLES, 0.2j * coefficient),
+        np.tile(expected_cr_half, 2),
         rtol=0.0,
         atol=1e-15,
     )
     assert_allclose(
         sampled[TARGET],
-        (0.1 - 0.05j) * coefficient + expected_srre,
+        np.tile(expected_target_half, 2),
         rtol=0.0,
         atol=1e-15,
     )

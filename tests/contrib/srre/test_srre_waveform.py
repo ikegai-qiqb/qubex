@@ -204,6 +204,26 @@ def test_calculate_srre_moments_uses_instantaneous_nonlinear_rabi_rate() -> None
     assert moments.f1 == pytest.approx(0.0j, abs=1e-14)
 
 
+def test_calculate_srre_moments_batches_vectorized_rabi_rate() -> None:
+    """A vector-capable Rabi relation should be evaluated once per waveform."""
+    call_shapes: list[tuple[int, ...]] = []
+
+    def vectorized_rabi_rate(amplitude: float | np.ndarray) -> float | np.ndarray:
+        values = np.asarray(amplitude)
+        call_shapes.append(values.shape)
+        return 0.02 * values
+
+    calculate_srre_moments(
+        block_duration=8.0,
+        ramp_time=1.0,
+        amplitude=0.5,
+        rabi_rate_from_amplitude=vectorized_rabi_rate,  # type: ignore[arg-type]
+        sampling_period=1.0,
+    )
+
+    assert call_shapes == [(8,)]
+
+
 @pytest.mark.parametrize(
     "bad_rate",
     [

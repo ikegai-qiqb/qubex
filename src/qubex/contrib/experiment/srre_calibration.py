@@ -14,6 +14,7 @@ from qubex.experiment.experiment_constants import CALIBRATION_SHOTS
 from qubex.experiment.models.result import Result
 from qubex.measurement.measurement_defaults import resolve_measurement_defaults
 from qubex.pulse import Arbitrary, PulseSchedule, Waveform
+from qubex.visualization import make_figure
 
 from .srre_waveform import predict_srre_amplitude, srre_waveform
 
@@ -128,8 +129,13 @@ def calibrate_srre(
 
     exp.pulse.validate_rabi_params([target])
 
+    rabi_rate_per_amplitude = _as_positive_float(
+        exp.pulse.calc_rabi_rate(target, 1.0),
+        name="Rabi rate at unit amplitude",
+    )
+
     def rabi_rate_from_amplitude(amplitude: float) -> float:
-        return float(exp.pulse.calc_rabi_rate(target, amplitude))
+        return amplitude * rabi_rate_per_amplitude
 
     prediction = predict_srre_amplitude(
         block_duration=block_duration,
@@ -369,7 +375,7 @@ def _plot_linear_fit(
     ylabel: str,
 ) -> None:
     """Show measured zero-crossing data together with its fitted line."""
-    figure = go.Figure()
+    figure = make_figure()
     figure.add_trace(
         go.Scatter(x=x_values, y=signal, mode="markers", name="Measurement")
     )

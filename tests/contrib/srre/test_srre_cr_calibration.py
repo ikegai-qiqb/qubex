@@ -161,21 +161,47 @@ def test_signal_functions_reject_complex_states() -> None:
         _calculate_zx_signals(np.array([1.0 + 0.1j, 0.0, 0.0, -1.0]))
 
 
-def test_zero_crossing_uses_one_linear_fit_over_the_full_sweep() -> None:
-    """The root and fitted values should come from all measured sweep points."""
+def test_zero_crossing_refits_points_near_the_preliminary_root() -> None:
+    """A preliminary root between points 11 and 12 should exclude points 1--3."""
+    values = np.arange(17, dtype=np.float64)
+    signal = values - 10.0
+    signal[:3] -= 136.0 / 13.0
+
     analysis = _fit_zero_crossing(
-        sweep_values=[0.0, 0.2, 0.4, 0.6],
-        error_signal=[-0.35, -0.15, 0.05, 0.25],
+        sweep_values=values,
+        error_signal=signal,
     )
 
-    assert analysis.root == pytest.approx(0.35, abs=1e-15)
-    assert analysis.root_bracket == pytest.approx((0.0, 0.6), abs=1e-15)
+    assert analysis.root == pytest.approx(10.0, abs=1e-14)
+    assert analysis.root_bracket == pytest.approx((0.0, 16.0), abs=1e-15)
     assert analysis.fit_slope == pytest.approx(1.0, abs=1e-14)
     assert_allclose(
         analysis.fitted_signal,
-        [-0.35, -0.15, 0.05, 0.25],
+        values - 10.0,
         rtol=0.0,
-        atol=1e-15,
+        atol=1e-14,
+    )
+
+
+def test_zero_crossing_uses_the_original_sweep_span_after_expansion() -> None:
+    """An expanded fit should keep the distance cutoff from the original sweep."""
+    values = np.arange(25, dtype=np.float64)
+    signal = values - 18.0
+    signal[:11] -= 100.0 / 11.0
+
+    analysis = _fit_zero_crossing(
+        sweep_values=values,
+        error_signal=signal,
+        reference_sweep_span=16.0,
+    )
+
+    assert analysis.root == pytest.approx(18.0, abs=1e-14)
+    assert analysis.root_bracket == pytest.approx((0.0, 24.0), abs=1e-15)
+    assert_allclose(
+        analysis.fitted_signal,
+        values - 18.0,
+        rtol=0.0,
+        atol=1e-14,
     )
 
 
@@ -239,10 +265,10 @@ def test_duration_resolution_rejects_negative_zx_rotation_rate() -> None:
 
 
 def test_default_cancel_offsets_use_target_rabi_rate_and_requested_rotation() -> None:
-    """Each cancellation edge should rotate 0.2/N rad in one CR primitive."""
+    """Each edge should add 0.16/N per ZX90 and 0.32 over the sequence."""
     exp = _Experiment()
     error_amplification_n = 4
-    effective_duration = 192.0 - 16.0
+    half_effective_duration = 192.0 - 16.0
 
     offsets = _default_cancel_offsets(
         cast(Any, exp),
@@ -252,13 +278,21 @@ def test_default_cancel_offsets_use_target_rabi_rate_and_requested_rotation() ->
         error_amplification_n=error_amplification_n,
     )
 
-    assert offsets.size == 21
+    assert offsets.size == 17
     assert offsets[0] == pytest.approx(-offsets[-1], abs=1e-15)
-    edge_rabi_rate = offsets[-1] * 0.02
-    edge_rotation = (
-        2.0 * np.pi * edge_rabi_rate * error_amplification_n * effective_duration
+    previous_edge_rabi_rate = 0.2 / (
+        2.0 * np.pi * error_amplification_n * 2.0 * half_effective_duration
     )
-    assert edge_rotation == pytest.approx(0.2, abs=1e-15)
+    previous_edge_offset = previous_edge_rabi_rate / 0.02
+    assert offsets[-1] == pytest.approx(0.8 * previous_edge_offset, abs=1e-15)
+    edge_rabi_rate = offsets[-1] * 0.02
+    one_gate_rotation = 2.0 * np.pi * edge_rabi_rate * 2.0 * half_effective_duration
+    sequence_rotation = one_gate_rotation * 2 * error_amplification_n
+    assert one_gate_rotation == pytest.approx(
+        0.16 / error_amplification_n,
+        abs=1e-15,
+    )
+    assert sequence_rotation == pytest.approx(0.32, abs=1e-15)
     assert exp.pulse.validated_targets == [[TARGET]]
 
 
@@ -271,7 +305,7 @@ def test_sweep_expansion_extends_only_toward_root_up_to_twice_the_span(
     expected_edge: float,
 ) -> None:
     """Range expansion should preserve the other edge and double one half-span."""
-    values = 0.5 * np.linspace(0.84, 1.16, 9)
+    values = 0.5 * np.linspace(0.84, 1.16, 17)
 
     expanded = _expand_sweep_toward_root(
         values,
@@ -334,7 +368,7 @@ def test_explicit_duration_centers_default_cr_sweep_on_predicted_zx90_amplitude(
     expected_amplitude = 1.0 / (8.0 * 0.01 * (96.0 - 16.0))
     assert_allclose(
         measured_ranges[0],
-        expected_amplitude * np.linspace(0.84, 1.16, 9),
+        expected_amplitude * np.linspace(0.84, 1.16, 17),
         rtol=0.0,
         atol=1e-15,
     )
@@ -381,36 +415,26 @@ def test_default_sweeps_and_context_interval_are_used_in_the_public_workflow(
     fit_calls = [call for call in calls if len(call["sweep_values"]) > 2]
     assert [call["stage"] for call in fit_calls] == [
         "zx",
-        "zx",
         "zy",
         "iy",
         "ix",
         "zx",
-        "zx",
     ]
     assert [len(call["sweep_values"]) for call in fit_calls] == [
-        9,
         17,
         17,
-        21,
-        21,
-        9,
+        17,
+        17,
         17,
     ]
     assert_allclose(
         fit_calls[0]["sweep_values"],
-        fit_calls[0]["sweep_values"].mean() * np.linspace(0.84, 1.16, 9),
+        fit_calls[0]["sweep_values"].mean() * np.linspace(0.84, 1.16, 17),
         rtol=0.0,
         atol=1e-15,
     )
     assert_allclose(
-        fit_calls[1]["sweep_values"],
-        fit_calls[1]["sweep_values"].mean() * np.linspace(0.92, 1.08, 17),
-        rtol=0.0,
-        atol=1e-15,
-    )
-    assert_allclose(
-        fit_calls[2]["sweep_values"] - 0.2,
+        fit_calls[1]["sweep_values"] - 0.2,
         np.linspace(-0.16, 0.16, 17),
         rtol=0.0,
         atol=1e-15,
@@ -505,6 +529,54 @@ def test_fine_stage_rejects_reference_pulse_on_another_sampling_grid(
     monkeypatch.setattr(calibration_module, "_build_srre_cross_resonance", fake_builder)
 
     with pytest.raises(ValueError, match="sampling period"):
+        _build_stage_sequence(
+            cast(Any, exp),
+            CONTROL,
+            TARGET,
+            calibration={"srre_calibration": {"sampling_period": SAMPLING_PERIOD}},
+            stage="zy",
+            control_state="0",
+            error_amplification_n=1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("samples", "message"),
+    [
+        ([], "at least one sample"),
+        ([np.nan], "finite samples"),
+        ([1.1], "hardware limit"),
+    ],
+)
+def test_fine_stage_rejects_invalid_reference_pulse_samples(
+    monkeypatch: pytest.MonkeyPatch,
+    samples: list[float],
+    message: str,
+) -> None:
+    """Fine-stage reference pulses must be safe finite hardware waveforms."""
+
+    def fake_builder(*_args: Any, **_kwargs: Any) -> PulseSchedule:
+        with PulseSchedule([f"{CONTROL}-{TARGET}", TARGET]) as schedule:
+            schedule.add(
+                f"{CONTROL}-{TARGET}",
+                Arbitrary([0.2], sampling_period=SAMPLING_PERIOD),
+            )
+            schedule.add(
+                TARGET,
+                Arbitrary([0.1], sampling_period=SAMPLING_PERIOD),
+            )
+        return schedule
+
+    exp = _Experiment()
+    exp.pulse = SimpleNamespace(
+        y180=lambda _target: Arbitrary(
+            samples,
+            sampling_period=SAMPLING_PERIOD,
+        ),
+    )
+    monkeypatch.setattr(calibration_module, "_build_srre_cross_resonance", fake_builder)
+
+    with pytest.raises(ValueError, match=message):
         _build_stage_sequence(
             cast(Any, exp),
             CONTROL,
@@ -778,12 +850,12 @@ def test_cancel_stage_remeasures_once_after_directional_range_expansion(
     assert stage.accepted_calibration["cancel_y"] == pytest.approx(0.15, abs=1e-15)
 
 
-def test_cr_stage_expands_coarse_sweep_then_runs_the_fine_sweep(
+def test_cr_stage_expands_its_single_17_point_sweep(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """CR amplitude should expand coarse data before its 17-point fine fit."""
+    """CR amplitude should expand its only fit without a separate fine sweep."""
     measured_ranges: list[np.ndarray] = []
-    fitted_roots = iter((0.62, 0.62, 0.64))
+    fitted_roots = iter((0.62, 0.64))
     last_root = 0.5
 
     def fake_measure_stage(**kwargs: Any) -> Any:
@@ -810,7 +882,7 @@ def test_cr_stage_expands_coarse_sweep_then_runs_the_fine_sweep(
             "cancel_y": 0.0,
         },
         stage="zx",
-        sweep_values=0.5 * np.linspace(0.84, 1.16, 9),
+        sweep_values=0.5 * np.linspace(0.84, 1.16, 17),
         root_reference=0.5,
         error_amplification_n=1,
         scale_cancellation_with_cr=True,
@@ -819,35 +891,34 @@ def test_cr_stage_expands_coarse_sweep_then_runs_the_fine_sweep(
         shot_interval=1024.0,
         plot=False,
         allow_range_expansion=True,
-        fine_tune_cr=True,
     )
 
-    assert [values.size for values in measured_ranges] == [9, 13, 17, 2]
+    assert [values.size for values in measured_ranges] == [17, 25, 2]
     assert measured_ranges[1][-1] == pytest.approx(0.66, abs=1e-15)
-    assert_allclose(
-        measured_ranges[2],
-        0.62 * np.linspace(0.92, 1.08, 17),
-        rtol=0.0,
-        atol=1e-15,
-    )
     assert stage.data["root"] == pytest.approx(0.64, abs=1e-15)
     assert stage.accepted_calibration["cr_amplitude"] == pytest.approx(0.64, abs=1e-15)
 
 
-def test_phase_stage_fails_when_root_is_outside_default_offsets(
+@pytest.mark.parametrize(
+    ("root", "expected_lower", "expected_upper"),
+    [(0.37, 0.04, 0.52), (0.03, -0.12, 0.36)],
+)
+def test_phase_stage_remeasures_once_after_directional_range_expansion(
     monkeypatch: pytest.MonkeyPatch,
+    root: float,
+    expected_lower: float,
+    expected_upper: float,
 ) -> None:
-    """CR phase deliberately does not use the directional expansion fallback."""
-    measurement_count = 0
+    """CR phase should expand one side up to twice the default half-span."""
+    measured_ranges: list[np.ndarray] = []
 
     def fake_measure_stage(**kwargs: Any) -> Any:
-        nonlocal measurement_count
-        measurement_count += 1
         values = np.asarray(kwargs["sweep_values"], dtype=float)
+        measured_ranges.append(values)
         return _mock_stage_measurement(
             sweep_values=values,
             stage=kwargs["stage"],
-            root=0.37,
+            root=root,
         )
 
     monkeypatch.setattr(calibration_module, "_measure_stage", fake_measure_stage)
@@ -870,19 +941,75 @@ def test_phase_stage_fails_when_root_is_outside_default_offsets(
         verification_n_shots=256,
         shot_interval=1024.0,
         plot=False,
+        allow_range_expansion=True,
     )
 
-    assert measurement_count == 1
-    assert stage.data["status"] == "failed"
-    assert "outside" in stage.data["reason"]
+    assert len(measured_ranges) == 3
     assert_allclose(
-        stage.data["sweep_values"],
+        measured_ranges[0],
         0.2 + np.linspace(-0.16, 0.16, 17),
         rtol=0.0,
         atol=1e-15,
     )
-    assert stage.data["root"] == pytest.approx(0.37, abs=1e-15)
-    assert len(stage.data["fit_history"]) == 1
+    assert measured_ranges[1][0] == pytest.approx(expected_lower, abs=1e-15)
+    assert measured_ranges[1][-1] == pytest.approx(expected_upper, abs=1e-15)
+    assert stage.data["root"] == pytest.approx(root, abs=1e-15)
+    assert stage.accepted_calibration["cr_phase"] == pytest.approx(root, abs=1e-15)
+    assert len(stage.data["fit_history"]) == 2
+
+
+@pytest.mark.parametrize(("root", "expected_edge"), [(0.37, 0.52), (0.03, -0.12)])
+def test_public_workflow_expands_default_phase_sweep_toward_root(
+    monkeypatch: pytest.MonkeyPatch,
+    srre_calibration: dict[str, Any],
+    root: float,
+    expected_edge: float,
+) -> None:
+    """The default phase sweep should retry once toward an out-of-range root."""
+    fitted_roots: dict[str, float] = {}
+    phase_fit_ranges: list[np.ndarray] = []
+
+    def fake_measure_stage(**kwargs: Any) -> Any:
+        values = np.asarray(kwargs["sweep_values"], dtype=float)
+        stage = kwargs["stage"]
+        if values.size > 2:
+            fitted_roots[stage] = root if stage == "zy" else float(values.mean())
+            if stage == "zy":
+                phase_fit_ranges.append(values)
+        return _mock_stage_measurement(
+            sweep_values=values,
+            stage=stage,
+            root=fitted_roots[stage],
+        )
+
+    monkeypatch.setattr(calibration_module, "_measure_stage", fake_measure_stage)
+    result = calibrate_srre_zx90(
+        cast(Any, _Experiment()),
+        CONTROL,
+        TARGET,
+        cr_half_duration=192.0,
+        srre_ramp_time=20.0,
+        srre_calibration=srre_calibration,
+        cr_amplitude_range=[0.3, 0.4, 0.5],
+        cancel_y_offsets=[-0.1, 0.0, 0.1],
+        cancel_x_offsets=[-0.1, 0.0, 0.1],
+        max_fine_rounds=1,
+        plot=False,
+    )
+
+    assert len(phase_fit_ranges) == 2
+    assert_allclose(
+        phase_fit_ranges[0],
+        0.2 + np.linspace(-0.16, 0.16, 17),
+        rtol=0.0,
+        atol=1e-15,
+    )
+    if root > 0.2:
+        assert phase_fit_ranges[1][-1] == pytest.approx(expected_edge, abs=1e-15)
+    else:
+        assert phase_fit_ranges[1][0] == pytest.approx(expected_edge, abs=1e-15)
+    calibration = cast(dict[str, Any], result.data["srre_cr_calibration"])
+    assert calibration["fine_rounds"][0]["phase_stage"]["status"] == "accepted"
 
 
 def test_stage_plot_contains_measurements_and_linear_fit(
@@ -929,6 +1056,8 @@ def test_stage_plot_contains_measurements_and_linear_fit(
     assert len(shown_figures) == 1
     assert [trace.mode for trace in shown_figures[0].data] == ["markers", "lines"]
     assert shown_figures[0].layout.yaxis.title.text == "S_ZY"
+    assert shown_figures[0].layout.template.layout.width == 600
+    assert shown_figures[0].layout.template.layout.height == 300
 
 
 @pytest.mark.parametrize(
@@ -982,7 +1111,7 @@ def test_calibrate_srre_zx90_orchestrates_all_stages_and_returns_contract(
         stage = kwargs["stage"]
         values = np.asarray(kwargs["sweep_values"], dtype=float)
         if stage == "zx" and values.size > 2:
-            root = (0.41, 0.42, 0.43, 0.44)[zx_fit_index]
+            root = (0.41, 0.42)[zx_fit_index]
             last_zx_root = root
             zx_fit_index += 1
         elif stage == "zx":
@@ -1022,10 +1151,10 @@ def test_calibrate_srre_zx90_orchestrates_all_stages_and_returns_contract(
     assert calibration["control_qubit"] == CONTROL
     assert calibration["target_qubit"] == TARGET
     assert calibration["cr_half_duration"] == pytest.approx(192.0)
-    assert calibration["cr_amplitude"] == pytest.approx(0.44, abs=1e-14)
+    assert calibration["cr_amplitude"] == pytest.approx(0.42, abs=1e-14)
     assert calibration["cr_phase"] == pytest.approx(0.1, abs=1e-14)
-    assert calibration["cancel_x"] == pytest.approx(0.08 * 0.44 / 0.42)
-    assert calibration["cancel_y"] == pytest.approx(0.02 * 0.44 / 0.42)
+    assert calibration["cancel_x"] == pytest.approx(0.08 * 0.42 / 0.41)
+    assert calibration["cancel_y"] == pytest.approx(0.02 * 0.42 / 0.41)
     assert calibration["cancel_amplitude"] == pytest.approx(
         abs(calibration["cancel_x"] + 1j * calibration["cancel_y"])
     )
@@ -1061,21 +1190,19 @@ def test_calibrate_srre_zx90_orchestrates_all_stages_and_returns_contract(
     assert [call["stage"] for call in calls] == [
         "zx",
         "zx",
-        "zx",
         "zy",
         "zy",
         "iy",
         "iy",
         "ix",
         "ix",
-        "zx",
         "zx",
         "zx",
     ]
     assert all(call["error_amplification_n"] == 2 for call in calls)
     assert calls[0]["n_shots"] == 128
-    assert calls[1]["n_shots"] == 128
-    assert calls[2]["n_shots"] == 512
+    assert calls[1]["n_shots"] == 512
+    assert calls[2]["n_shots"] == 128
     assert exp.note.calls == [f"{CONTROL}-{TARGET}"]
     assert srre_calibration.keys() == original_srre.keys()
     for key, expected in original_srre.items():

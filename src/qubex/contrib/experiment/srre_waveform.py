@@ -438,6 +438,21 @@ def _evaluate_rabi_rates(
     amplitudes: NDArray[np.float64],
     rabi_rate_from_amplitude: Callable[[float], float],
 ) -> NDArray[np.float64]:
+    """Evaluate a scalar Rabi relation, batching when the callback supports it."""
+    try:
+        vectorized_rabi_rate = cast(
+            Callable[[NDArray[np.float64]], object],
+            rabi_rate_from_amplitude,
+        )
+        batched_values = _as_finite_rabi_rate_vector(
+            vectorized_rabi_rate(amplitudes),
+            expected_shape=amplitudes.shape,
+        )
+    except (TypeError, ValueError):
+        pass
+    else:
+        return batched_values
+
     values: list[float] = []
     for amplitude in amplitudes:
         rate = rabi_rate_from_amplitude(float(amplitude))
@@ -449,6 +464,24 @@ def _evaluate_rabi_rates(
             ) from exc
         values.append(value)
     return np.asarray(values, dtype=np.float64)
+
+
+def _as_finite_rabi_rate_vector(
+    values: object,
+    *,
+    expected_shape: tuple[int, ...],
+) -> NDArray[np.float64]:
+    """Validate a vectorized Rabi-rate result with the requested shape."""
+    array = np.asarray(values)
+    if array.shape != expected_shape:
+        raise ValueError("vectorized Rabi-rate result has an unexpected shape.")
+    return np.asarray(
+        [
+            _as_finite_float(value, name="rabi_rate_from_amplitude result")
+            for value in array.flat
+        ],
+        dtype=np.float64,
+    ).reshape(expected_shape)
 
 
 def _validate_waveform_amplitude(amplitude: float) -> float:

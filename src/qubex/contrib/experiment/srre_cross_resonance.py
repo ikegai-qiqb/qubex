@@ -137,7 +137,7 @@ def _build_srre_cross_resonance(
     x180: TargetMap[Waveform] | Waveform | None = None,
     x180_margin: float = 0.0,
 ) -> PulseSchedule:
-    """Build one of the echo/SRRE configurations used during calibration."""
+    """Build a full-angle gate in one echo/SRRE calibration configuration."""
     control_qubit = _as_label(control_qubit, name="control_qubit")
     target_qubit = _as_label(target_qubit, name="target_qubit")
     if control_qubit == target_qubit:
@@ -160,7 +160,8 @@ def _build_srre_cross_resonance(
         include_srre=include_srre,
     )
     if not echo:
-        return half
+        # ``angle`` is the full-gate angle; each calibrated half contributes half.
+        return half.repeated(2)
 
     resolved_echo = _resolve_echo(
         exp,

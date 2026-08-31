@@ -391,6 +391,32 @@ def test_calibrate_srre_uses_new_defaults_and_context_interval() -> None:
     assert exp.measurement_service.calls[0]["shot_interval"] == pytest.approx(4096.0)
 
 
+@pytest.mark.parametrize(
+    ("unit_rabi_rate", "message"),
+    [
+        (0.0, "positive"),
+        (-0.02, "positive"),
+        (np.nan, "finite"),
+    ],
+)
+def test_calibrate_srre_rejects_invalid_unit_amplitude_rabi_rate(
+    unit_rabi_rate: float,
+    message: str,
+) -> None:
+    """Root prediction requires a finite positive Rabi rate at unit amplitude."""
+    exp = _Experiment()
+    exp.pulse.calc_rabi_rate = lambda _target, _amplitude: unit_rabi_rate
+
+    with pytest.raises(ValueError, match=message):
+        calibrate_srre(
+            cast(Any, exp),
+            "Q00",
+            block_duration=200.0,
+            ramp_time=0.0,
+            plot=False,
+        )
+
+
 def test_calibrate_srre_plots_differential_signal_and_fit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -414,6 +440,8 @@ def test_calibrate_srre_plots_differential_signal_and_fit(
     assert [trace.name for trace in shown[0].data] == ["Measurement", "Linear fit"]
     assert shown[0].layout.xaxis.title.text == "SRRE amplitude"
     assert shown[0].layout.yaxis.title.text == "Differential signal"
+    assert shown[0].layout.template.layout.width == 600
+    assert shown[0].layout.template.layout.height == 300
 
 
 @pytest.mark.parametrize(

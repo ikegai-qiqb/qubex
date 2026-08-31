@@ -17,6 +17,7 @@ from qubex.experiment.experiment_constants import CALIBRATION_SHOTS
 from qubex.experiment.models.result import Result
 from qubex.measurement.measurement_defaults import resolve_measurement_defaults
 from qubex.pulse import Arbitrary, PulseArray, PulseSchedule, Waveform
+from qubex.visualization import make_figure
 
 from .srre_calibration import calibrate_srre
 from .srre_cross_resonance import _build_srre_cross_resonance
@@ -30,11 +31,10 @@ _DURATION_UNIT = 16.0
 _NUMERIC_TOLERANCE = 1e-12
 _MIN_ABSOLUTE_SLOPE = 1e-9
 _SIGNAL_TOLERANCE = 0.02
-_DEFAULT_CR_SWEEP_FACTORS = np.linspace(0.84, 1.16, 9)
-_FINE_CR_SWEEP_FACTORS = np.linspace(0.92, 1.08, 17)
+_DEFAULT_CR_SWEEP_FACTORS = np.linspace(0.84, 1.16, 17)
 _DEFAULT_PHASE_OFFSETS = np.linspace(-0.16, 0.16, 17)
-_DEFAULT_CANCEL_SWEEP_POINTS = 21
-_DEFAULT_CANCEL_EDGE_ROTATION = 0.2
+_DEFAULT_CANCEL_SWEEP_POINTS = 17
+_DEFAULT_CANCEL_EDGE_ROTATION = 0.16
 _MAX_SWEEP_EXPANSION_FACTOR = 2.0
 _STAGE_CONFIGURATIONS: dict[_Stage, tuple[bool, bool]] = {
     "zx": (True, True),
@@ -136,7 +136,9 @@ def calibrate_srre_zx90(
     `obtain_cr_params`, fixes one CR-half/SRRE geometry, calibrates or reuses the
     one-qubit SRRE amplitude, and performs the documented ZX, ZY, IY, and IX
     four-state zero-crossing stages. Every proposed parameter is remeasured at
-    a fresh verification point before it is accepted.
+    a fresh verification point before it is accepted. Each zero-crossing fit
+    is repeated using only points within half the original sweep span of its
+    preliminary root when that leaves at least two points.
 
     Parameters
     ----------
@@ -160,17 +162,17 @@ def calibrate_srre_zx90(
         Positive one-qubit SRRE probe detuning in GHz.
     cr_amplitude_range : ArrayLike | None, optional
         Strictly increasing positive absolute CR amplitudes not exceeding one
-        for stages 8 and 11. When omitted, nine points spanning +/-16% around
+        for stages 8 and 11. When omitted, 17 points spanning +/-16% around
         the ZX90 amplitude predicted for the fixed CR-half duration are used.
-        The fitted root is subsequently fine-tuned over 17 points spanning
-        +/-8%.
     cr_phase_offsets : ArrayLike | None, optional
         Strictly increasing phase offsets in radians for stage 9a. Defaults to
-        17 points spanning +/-0.16 rad.
+        17 points spanning +/-0.16 rad. If the fitted root lies outside the
+        measured range, the sweep is extended once toward it, up to twice the
+        original half-span.
     cancel_y_offsets : ArrayLike | None, optional
         Strictly increasing cancellation-Y offsets for stage 9b. By default,
-        target Rabi parameters set 21 symmetric points whose sweep edges rotate
-        by `0.2 / N` rad in one candidate gate.
+        target Rabi parameters set 17 symmetric points whose sweep edges rotate
+        by `0.16 / N` rad in one candidate gate.
     cancel_x_offsets : ArrayLike | None, optional
         Strictly increasing cancellation-X offsets for stage 9c. Its default is
         resolved in the same way as `cancel_y_offsets`.
@@ -319,7 +321,6 @@ def calibrate_srre_zx90(
         shot_interval=resolved_interval,
         plot=plot,
         allow_range_expansion=True,
-        fine_tune_cr=True,
     )
     accepted = initial_angle.accepted_calibration
 
@@ -416,8 +417,9 @@ def _fit_zero_crossing(
     sweep_values: ArrayLike,
     error_signal: ArrayLike,
     allow_outside: bool = False,
+    reference_sweep_span: float | None = None,
 ) -> _ZeroCrossingAnalysis:
-    """Fit one line to a calibration signal and return its zero crossing."""
+    """Fit all points, then locally refit when at least two points remain."""
     values = _as_finite_vector(sweep_values, name="sweep_values")
     signal = _as_finite_vector(error_signal, name="error_signal")
     if values.shape != signal.shape:
@@ -427,6 +429,46 @@ def _fit_zero_crossing(
     if np.any(np.diff(values) <= 0.0):
         raise ValueError("sweep_values must be strictly increasing.")
 
+    lower = float(values[0])
+    upper = float(values[-1])
+    preliminary_slope, preliminary_intercept, preliminary_root = (
+        _fit_linear_zero_crossing(values, signal)
+    )
+    if reference_sweep_span is None:
+        fit_span = upper - lower
+    else:
+        fit_span = _as_positive_float(
+            reference_sweep_span,
+            name="reference_sweep_span",
+        )
+    fit_half_width = fit_span / 2.0
+    fit_mask = np.abs(values - preliminary_root) <= fit_half_width + _NUMERIC_TOLERANCE
+    if np.count_nonzero(fit_mask) < 2:
+        slope = preliminary_slope
+        intercept = preliminary_intercept
+        root = preliminary_root
+    else:
+        slope, intercept, root = _fit_linear_zero_crossing(
+            values[fit_mask],
+            signal[fit_mask],
+        )
+
+    if not allow_outside and not lower <= root <= upper:
+        raise ValueError("Fitted root lies outside the measured sweep range.")
+    return _ZeroCrossingAnalysis(
+        root=root,
+        root_bracket=(lower, upper),
+        fit_slope=slope,
+        fit_intercept=intercept,
+        fitted_signal=slope * values + intercept,
+    )
+
+
+def _fit_linear_zero_crossing(
+    values: NDArray[np.float64],
+    signal: NDArray[np.float64],
+) -> tuple[float, float, float]:
+    """Fit one line to validated arrays and return slope, intercept, and root."""
     centered_values = values - np.mean(values)
     denominator = float(np.dot(centered_values, centered_values))
     if denominator == 0.0:
@@ -435,18 +477,7 @@ def _fit_zero_crossing(
     if not np.isfinite(slope) or abs(slope) < _MIN_ABSOLUTE_SLOPE:
         raise ValueError("Measured zero-crossing slope is too small.")
     intercept = float(np.mean(signal) - slope * np.mean(values))
-    root = -intercept / slope
-    lower = float(values[0])
-    upper = float(values[-1])
-    if not allow_outside and not lower <= root <= upper:
-        raise ValueError("Fitted root lies outside the measured sweep range.")
-    return _ZeroCrossingAnalysis(
-        root=float(root),
-        root_bracket=(lower, upper),
-        fit_slope=float(slope),
-        fit_intercept=intercept,
-        fitted_signal=slope * values + intercept,
-    )
+    return slope, intercept, float(-intercept / slope)
 
 
 def _resolve_cr_half_duration(
@@ -595,7 +626,7 @@ def _build_stage_sequence(
         ),
         name="srre_calibration.sampling_period",
     )
-    _validate_reference_pulse_sampling(
+    _validate_reference_pulse(
         interleaved_pulse,
         name="fine-stage reference pulse",
         sampling_period=sampling_period,
@@ -614,12 +645,13 @@ def _build_stage_sequence(
     return cycle.repeated(repetitions)
 
 
-def _validate_reference_pulse_sampling(
+def _validate_reference_pulse(
     pulse: Waveform,
     *,
     name: str,
     sampling_period: float,
 ) -> None:
+    """Validate the sampling grid and samples of a fine-stage reference pulse."""
     waveforms = (
         pulse.get_flattened_waveforms(apply_frame_shifts=False)
         if isinstance(pulse, PulseArray)
@@ -636,6 +668,15 @@ def _validate_reference_pulse_sampling(
         ):
             raise ValueError(
                 f"{name} sampling period must match the SRRE sampling period."
+            )
+        values = np.asarray(waveform.values, dtype=np.complex128)
+        if values.size == 0:
+            raise ValueError(f"{name} must contain at least one sample.")
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"{name} must contain only finite samples.")
+        if np.max(np.abs(values)) > 1.0 + _NUMERIC_TOLERANCE:
+            raise ValueError(
+                f"{name} amplitude must not exceed the hardware limit of 1."
             )
 
 
@@ -759,6 +800,13 @@ def _measure_fitted_stage(
 ) -> tuple[_StageMeasurement, _ZeroCrossingAnalysis, list[dict[str, Any]]]:
     """Measure and fit a stage, extending once toward an out-of-range root."""
     values = _as_finite_vector(sweep_values, name="sweep_values")
+    if values.size < 2:
+        raise ValueError("sweep_values must contain at least two points.")
+    # Keep the local-refit window fixed if a second measurement extends one side.
+    reference_sweep_span = _as_positive_float(
+        values[-1] - values[0],
+        name="reference_sweep_span",
+    )
     fit_history: list[dict[str, Any]] = []
     for attempt in range(2):
         measurement = _measure_stage(
@@ -777,6 +825,7 @@ def _measure_fitted_stage(
             sweep_values=measurement.sweep_values,
             error_signal=measurement.error_signal,
             allow_outside=True,
+            reference_sweep_span=reference_sweep_span,
         )
         fit_history.append(_fit_measurement_data(measurement, analysis))
         if plot:
@@ -811,11 +860,8 @@ def _run_parameter_stage(
     shot_interval: float,
     plot: bool,
     allow_range_expansion: bool = False,
-    fine_tune_cr: bool = False,
 ) -> _StageRun:
     """Sweep, propose, freshly verify, and conditionally accept one parameter."""
-    if fine_tune_cr and stage != "zx":
-        raise ValueError("fine_tune_cr is supported only for the ZX stage.")
     current = _copy_calibration(accepted)
     current_parameter = _stage_parameter_value(current, stage=stage)
     input_params = _parameter_snapshot(current)
@@ -840,24 +886,6 @@ def _run_parameter_stage(
             allow_range_expansion=allow_range_expansion,
         )
         _require_root_in_measured_range(analysis)
-        if fine_tune_cr:
-            measurement, analysis, fine_history = _measure_fitted_stage(
-                exp,
-                control_qubit,
-                target_qubit,
-                calibration=current,
-                stage=stage,
-                sweep_values=_fine_cr_amplitude_range(analysis.root),
-                root_reference=analysis.root,
-                error_amplification_n=error_amplification_n,
-                scale_cancellation_with_cr=scale_cancellation_with_cr,
-                n_shots=n_shots,
-                shot_interval=shot_interval,
-                plot=plot,
-                allow_range_expansion=allow_range_expansion,
-            )
-            fit_history.extend(fine_history)
-            _require_root_in_measured_range(analysis)
         proposed = _apply_stage_candidate(
             current,
             stage=stage,
@@ -1018,7 +1046,7 @@ def _run_fine_round(
             verification_n_shots=verification_n_shots,
             shot_interval=shot_interval,
             plot=plot,
-            allow_range_expansion=stage in ("iy", "ix"),
+            allow_range_expansion=True,
         )
         round_data[data_key] = stage_run.data
         current = stage_run.accepted_calibration
@@ -1052,7 +1080,6 @@ def _run_fine_round(
         shot_interval=shot_interval,
         plot=plot,
         allow_range_expansion=True,
-        fine_tune_cr=True,
     )
     round_data["final_angle_stage"] = final_angle.data
     current = final_angle.accepted_calibration
@@ -1334,15 +1361,6 @@ def _resolve_cr_amplitude_range(
     return result.copy()
 
 
-def _fine_cr_amplitude_range(center_amplitude: float) -> NDArray[np.float64]:
-    """Return the default 17-point ±8% fine CR amplitude sweep."""
-    center = _as_positive_float(center_amplitude, name="fine center cr_amplitude")
-    values = np.unique(np.clip(center * _FINE_CR_SWEEP_FACTORS, 0.0, 1.0))
-    if values.size < 2:
-        raise ValueError("Fine CR amplitude range must contain at least two points.")
-    return values
-
-
 def _expand_sweep_toward_root(
     values: NDArray[np.float64],
     *,
@@ -1403,17 +1421,18 @@ def _default_cancel_offsets(
     cr_ramptime: float,
     error_amplification_n: int,
 ) -> NDArray[np.float64]:
-    """Resolve cancellation offsets giving 0.2/N radians per gate at each edge."""
+    """Resolve cancellation offsets giving 0.16/N radians per gate at each edge."""
     repetitions = _as_positive_integer(
         error_amplification_n, name="error_amplification_n"
     )
-    effective_duration = _as_positive_float(
+    half_effective_duration = _as_positive_float(
         cr_half_duration - cr_ramptime,
-        name="cancellation effective duration",
+        name="cancellation half effective duration",
     )
+    gate_effective_duration = 2.0 * half_effective_duration
     exp.pulse.validate_rabi_params([target_qubit])
     edge_rabi_rate = _DEFAULT_CANCEL_EDGE_ROTATION / (
-        2.0 * np.pi * repetitions * effective_duration
+        2.0 * np.pi * repetitions * gate_effective_duration
     )
     edge_offset = abs(
         _as_finite_float(
@@ -1517,7 +1536,7 @@ def _plot_stage_fit(
     stage: _Stage,
 ) -> None:
     """Show one CR calibration signal together with its fitted line."""
-    figure = go.Figure()
+    figure = make_figure()
     figure.add_trace(
         go.Scatter(
             x=measurement.sweep_values,
