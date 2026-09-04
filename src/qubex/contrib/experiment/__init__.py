@@ -14,6 +14,14 @@ from .cpmg_noise_spectroscopy import (
     cpmg_noise_spectroscopy,
     plot_cpmg_results,
 )
+from .cr_pulse_coherence_characterization import (
+    DEFAULT_N_VALUES,
+    ExponentialDecayFit,
+    ThreeLevelRateFit,
+    characterize_cr_pulse_coherence,
+    fit_exponential_decay,
+    fit_three_level_rate_model,
+)
 from .cr_xt_decomposition import decompose_cr_crosstalk
 from .crosstalk_cross_resonance import (
     cr_crosstalk_hamiltonian_tomography,
@@ -116,10 +124,13 @@ from .thermal_excitation_characterization import (
 )
 
 __all__ = [
+    "DEFAULT_N_VALUES",
+    "ExponentialDecayFit",
     "GefPopulationBootstrap",
     "GefPopulationCalibration",
     "GefPopulationFit",
     "IQMomentSummary",
+    "ThreeLevelRateFit",
     "analyze_chevron_matched_transform",
     "bootstrap_gef_populations",
     "calibrate_cr_pi_pulse",
@@ -128,6 +139,7 @@ __all__ = [
     "calibrate_gf_pi_pulse",
     "calibrate_gf_pulse",
     "characterize_coarse_readout_parameters",
+    "characterize_cr_pulse_coherence",
     "characterize_readout_parameters",
     "ckp_measurement_v2",
     "cpmg_noise_spectroscopy",
@@ -154,7 +166,9 @@ __all__ = [
     "estimate_qubit_frequency_from_chevron_adaptive",
     "fh_ramsey_experiment",
     "filtered_ckp_experiment",
+    "fit_exponential_decay",
     "fit_gef_population",
+    "fit_three_level_rate_model",
     "fourier_analysis",
     "get_resistance_charge",
     "get_superconducting_gap",
