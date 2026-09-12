@@ -54,8 +54,9 @@ _DEFAULT_BOOTSTRAP_SEED = 0
 _DEFAULT_ACQUISITION_SEED: int | None = None
 _DEFAULT_PAIRS_PER_SWEEP = 1
 _DEFAULT_SWEEP_TIMEOUT_SECONDS = 300.0
-_DEFAULT_MAIN_REMAINING_FRACTIONS = (0.90, 0.70, 0.50, 0.30, 0.15)
-_ADDITIONAL_MAIN_REMAINING_FRACTIONS = (0.80, 0.60, 0.40, 0.20, 0.10, 0.05)
+_DEFAULT_AUTO_RANGE_REMAINING_FRACTION = 0.10
+_DEFAULT_MAIN_REMAINING_FRACTIONS = (0.90, 0.70, 0.50, 0.30, 0.15, 0.05)
+_ADDITIONAL_MAIN_REMAINING_FRACTIONS = (0.80, 0.60, 0.40, 0.20, 0.10, 0.02)
 _MIN_RECOMMENDED_TRIALS = 20
 _MIN_RECOMMENDED_CLIFFORD_POINTS = 6
 _MIN_AUTO_RANGE_FIT_POINTS = 6
@@ -3838,6 +3839,14 @@ def _run_single_target_auto_range(
             RuntimeWarning,
             stacklevel=3,
         )
+    if main_grid_selection.maximum_anchor_added:
+        warnings.warn(
+            "Paired-IRB main-grid tail target extends beyond `max_n_cliffords`; "
+            f"using the maximum Clifford length {maximum} as the tail anchor. "
+            "Increase `max_n_cliffords` if a deeper decay tail is required.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
     reference_fit, interleaved_fit = (
         (
             pilot_assessment.reference.fit,
@@ -4057,6 +4066,15 @@ def _run_parallel_auto_range(
                 "Parallel paired-IRB main-grid selection is falling back to the "
                 f"pilot candidate grid for `{target}`: "
                 f"{selection.fallback_reason}.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+        if selection.maximum_anchor_added:
+            warnings.warn(
+                "Parallel paired-IRB main-grid tail target for "
+                f"`{target}` extends beyond `max_n_cliffords`; using the maximum "
+                f"Clifford length {maximum} as the tail anchor. Increase "
+                "`max_n_cliffords` if a deeper decay tail is required.",
                 RuntimeWarning,
                 stacklevel=3,
             )
@@ -4653,7 +4671,7 @@ def paired_interleaved_randomized_benchmarking(
     n_cliffords_range: ArrayLike | None = None,
     auto_range: bool = True,
     pilot_n_trials: int = 6,
-    auto_range_remaining_fraction: float = 0.2,
+    auto_range_remaining_fraction: float = _DEFAULT_AUTO_RANGE_REMAINING_FRACTION,
     main_remaining_fractions: Collection[float] = _DEFAULT_MAIN_REMAINING_FRACTIONS,
     n_trials: int | None = None,
     seeds: ArrayLike | Mapping[str, ArrayLike] | None = None,
@@ -4721,12 +4739,15 @@ def paired_interleaved_randomized_benchmarking(
         when `max(p_ref**m, p_irb**m)` is no greater than this value at its
         current maximum length, both fits are valid, and both arms have endpoint
         decay significance of at least 3. Ignored when no pilot is run. Defaults
-        to 0.2.
+        to 0.10 so the pilot observes the decay well into its tail before main-grid
+        selection.
     main_remaining_fractions : Collection[float], optional
         Ordered, strictly decreasing contrast fractions used to place the main
         Clifford lengths for both fitted decay parameters while auto-range is
         active. Sets and frozensets are rejected. Ignored when no pilot is run.
-        Defaults to `(0.90, 0.70, 0.50, 0.30, 0.15)`.
+        Defaults to `(0.90, 0.70, 0.50, 0.30, 0.15, 0.05)` so the main fit
+        includes a point with only about 5% fitted contrast remaining, which
+        better constrains the free asymptote `C`.
     n_trials : int | None, optional
         Paired trials per main-measurement length. Must be at least 2 and
         defaults to 30. Two or three trials permit the point estimate but not
@@ -4869,7 +4890,7 @@ def paired_interleaved_randomized_benchmarking(
     else:
         # Pilot-only options are intentionally ignored when no pilot is run.
         resolved_pilot_trials = 6
-        resolved_remaining_fraction = 0.2
+        resolved_remaining_fraction = _DEFAULT_AUTO_RANGE_REMAINING_FRACTION
         resolved_main_remaining_fractions = _DEFAULT_MAIN_REMAINING_FRACTIONS
     if use_auto_range and seeds is not None:
         raise ValueError("`auto_range=True` cannot be combined with explicit `seeds`.")
