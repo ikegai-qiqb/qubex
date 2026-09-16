@@ -16,11 +16,7 @@ from .experiment.cpmg_noise_spectroscopy import (
     cpmg_noise_spectroscopy,
     plot_cpmg_results,
 )
-from .experiment.cr_dissipation import (
-    analyze_cr_dissipation,
-    characterize_cr_dissipation,
-    plot_cr_dissipation,
-)
+from .experiment.cr_dissipation import characterize_cr_dissipation
 from .experiment.cr_xt_decomposition import decompose_cr_crosstalk
 from .experiment.crosstalk_cross_resonance import (
     cr_crosstalk_hamiltonian_tomography,
@@ -137,7 +133,6 @@ __all__ = [
     "GefPopulationCalibration",
     "GefPopulationFit",
     "analyze_chevron_matched_transform",
-    "analyze_cr_dissipation",
     "calibrate_cr_pi_pulse",
     "calibrate_gef_population",
     "calibrate_gf_hpi_pulse",
@@ -204,7 +199,6 @@ __all__ = [
     "pb_experiment_1q",
     "pb_experiment_2q",
     "plot_cpmg_results",
-    "plot_cr_dissipation",
     "purity_benchmarking",
     "purity_sequence_1q",
     "purity_sequence_2q",
