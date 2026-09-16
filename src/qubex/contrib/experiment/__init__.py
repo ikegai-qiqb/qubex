@@ -14,10 +14,10 @@ from .cpmg_noise_spectroscopy import (
     cpmg_noise_spectroscopy,
     plot_cpmg_results,
 )
-from .cr_pulse_health_check import (
-    analyze_cr_pulse_health,
-    characterize_cr_pulse_health,
-    plot_cr_pulse_health,
+from .cr_dissipation import (
+    analyze_cr_dissipation,
+    characterize_cr_dissipation,
+    plot_cr_dissipation,
 )
 from .cr_xt_decomposition import decompose_cr_crosstalk
 from .crosstalk_cross_resonance import (
@@ -119,14 +119,14 @@ __all__ = [
     "GefPopulationCalibration",
     "GefPopulationFit",
     "analyze_chevron_matched_transform",
-    "analyze_cr_pulse_health",
+    "analyze_cr_dissipation",
     "calibrate_cr_pi_pulse",
     "calibrate_gef_population",
     "calibrate_gf_hpi_pulse",
     "calibrate_gf_pi_pulse",
     "calibrate_gf_pulse",
     "characterize_coarse_readout_parameters",
-    "characterize_cr_pulse_health",
+    "characterize_cr_dissipation",
     "characterize_readout_parameters",
     "ckp_measurement_v2",
     "cpmg_noise_spectroscopy",
@@ -185,7 +185,7 @@ __all__ = [
     "pb_experiment_1q",
     "pb_experiment_2q",
     "plot_cpmg_results",
-    "plot_cr_pulse_health",
+    "plot_cr_dissipation",
     "purity_benchmarking",
     "purity_sequence_1q",
     "purity_sequence_2q",
