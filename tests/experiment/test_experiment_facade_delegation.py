@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any, cast
+from unittest.mock import Mock
 
 import pytest
 
@@ -28,6 +29,14 @@ class _CalibrationServiceStub:
 class _BenchmarkingServiceStub:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    def randomized_benchmarking(self, **kwargs: Any) -> str:
+        self.calls.append(("randomized_benchmarking", kwargs))
+        return "randomized_benchmarking_result"
+
+    def interleaved_randomized_benchmarking(self, **kwargs: Any) -> str:
+        self.calls.append(("interleaved_randomized_benchmarking", kwargs))
+        return "interleaved_randomized_benchmarking_result"
 
     def benchmark_1q(self, **kwargs: Any) -> None:
         self.calls.append(("benchmark_1q", kwargs))
@@ -125,6 +134,9 @@ class _ExperimentContextStub:
 
     def reload(self) -> None:
         self.calls.append(("reload", {}))
+
+    def load_classifier(self, path: object = None) -> None:
+        self.calls.append(("load_classifier", {"path": path}))
 
     def register_custom_target(self, **kwargs: Any) -> None:
         self.calls.append(("register_custom_target", kwargs))
@@ -319,6 +331,34 @@ def test_benchmark_2q_delegates_to_benchmarking_service() -> None:
     ]
 
 
+def test_randomized_benchmarking_delegates_to_sync_service() -> None:
+    """Randomized benchmarking should delegate to its synchronous service."""
+    exp = object.__new__(Experiment)
+    benchmarking_stub = _BenchmarkingServiceStub()
+    exp.__dict__["_benchmarking_service"] = benchmarking_stub
+
+    result = exp.randomized_benchmarking(targets="Q00", plot=False)
+
+    assert result == "randomized_benchmarking_result"
+    assert benchmarking_stub.calls[0][0] == "randomized_benchmarking"
+
+
+def test_interleaved_randomized_benchmarking_delegates_to_sync_service() -> None:
+    """Interleaved randomized benchmarking should use its synchronous service."""
+    exp = object.__new__(Experiment)
+    benchmarking_stub = _BenchmarkingServiceStub()
+    exp.__dict__["_benchmarking_service"] = benchmarking_stub
+
+    result = exp.interleaved_randomized_benchmarking(
+        targets="Q00",
+        interleaved_clifford="X90",
+        plot=False,
+    )
+
+    assert result == "interleaved_randomized_benchmarking_result"
+    assert benchmarking_stub.calls[0][0] == "interleaved_randomized_benchmarking"
+
+
 def test_characterize_2q_delegates_in_same_mux_to_characterization_service() -> None:
     """Given in_same_mux, when characterize_2q is called, then it delegates to characterization service."""
     exp = object.__new__(Experiment)
@@ -420,6 +460,17 @@ def test_print_boxes_delegates_to_context() -> None:
     exp.print_boxes()
 
     assert context_stub.calls == [("print_boxes", {})]
+
+
+def test_load_classifier_delegates_to_context() -> None:
+    """Given a classifier path, when loading, then it delegates to experiment context."""
+    exp = object.__new__(Experiment)
+    context_stub = _ExperimentContextStub()
+    exp.__dict__["_experiment_context"] = context_stub
+
+    exp.load_classifier(path="custom-classifiers")
+
+    assert context_stub.calls == [("load_classifier", {"path": "custom-classifiers"})]
 
 
 def test_clifford_generator_property_delegates_to_benchmarking_service() -> None:
@@ -1236,3 +1287,35 @@ def test_get_dc_voltage_state_delegates_to_context() -> None:
         output="on",
     )
     assert context_stub.calls == [("get_dc_voltage_state", {"mux": 6})]
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "scan_qubit_frequencies",
+        "qubit_spectroscopy",
+        "measure_qubit_resonance",
+        "estimate_control_amplitude",
+    ],
+)
+@pytest.mark.parametrize("simultaneous_drive", [None, True, False])
+def test_spectroscopy_delegates_drive_timing(method, simultaneous_drive) -> None:
+    """Experiment should forward drive timing and shot settings to characterization."""
+    exp = object.__new__(Experiment)
+    service = Mock()
+    exp.__dict__["_characterization_service"] = service
+    delegate = getattr(service, method)
+
+    result = getattr(exp, method)(
+        "Q00",
+        frequency_range=[5.0, 5.01],
+        simultaneous_drive=simultaneous_drive,
+        n_shots=32,
+        shot_interval=100.0,
+    )
+
+    assert result is delegate.return_value
+    delegate.assert_called_once()
+    assert delegate.call_args.kwargs["simultaneous_drive"] is simultaneous_drive
+    assert delegate.call_args.kwargs["shots"] == 32
+    assert delegate.call_args.kwargs["interval"] == 100.0
