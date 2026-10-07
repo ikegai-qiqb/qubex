@@ -74,6 +74,10 @@ from .paired_interleaved_randomized_benchmarking import (
     measure_paired_irb,
     paired_interleaved_randomized_benchmarking,
 )
+from .pi_pair_rotary_zx90 import (
+    calibrate_pi_pair_rotary_zx90,
+    pi_pair_rotary_zx90,
+)
 from .purity_benchmarking import (
     interleaved_purity_benchmarking,
     ipb_experiment,
@@ -115,6 +119,7 @@ __all__ = [
     "calibrate_gf_hpi_pulse",
     "calibrate_gf_pi_pulse",
     "calibrate_gf_pulse",
+    "calibrate_pi_pair_rotary_zx90",
     "characterize_coarse_readout_parameters",
     "characterize_readout_parameters",
     "ckp_measurement_v2",
@@ -173,6 +178,7 @@ __all__ = [
     "partial_transpose",
     "pb_experiment_1q",
     "pb_experiment_2q",
+    "pi_pair_rotary_zx90",
     "plot_cpmg_results",
     "purity_benchmarking",
     "purity_sequence_1q",
