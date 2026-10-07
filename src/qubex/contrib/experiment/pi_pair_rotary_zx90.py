@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from itertools import pairwise
 from numbers import Real
 from typing import Any
 
 import numpy as np
 import plotly.graph_objects as go
 from numpy.typing import ArrayLike, NDArray
+from scipy.optimize import least_squares
 
+from qubex.analysis import util
 from qubex.experiment import Experiment
 from qubex.experiment.experiment_constants import (
     CALIBRATION_SHOTS,
@@ -25,10 +28,11 @@ __all__ = ["calibrate_pi_pair_rotary_zx90", "pi_pair_rotary_zx90"]
 
 _DURATION_UNIT = 16.0
 _DEFAULT_SWEEP_FRACTION = 0.16
-_DEFAULT_SWEEP_POINTS = 17
+_DEFAULT_SWEEP_POINTS = 33
+_DEFAULT_REPETITIONS = (1, 3, 5)
 _DEFAULT_ADIABATIC_SAFE_FACTOR = 0.75
 _TOLERANCE = 1e-12
-_MIN_SLOPE = 1e-9
+_TARGET_STATES = ("0", "1")
 
 
 def pi_pair_rotary_zx90(
@@ -170,6 +174,7 @@ def calibrate_pi_pair_rotary_zx90(
     amplitude_range: ArrayLike | None = None,
     sweep_fraction: float = _DEFAULT_SWEEP_FRACTION,
     sweep_points: int = _DEFAULT_SWEEP_POINTS,
+    repetitions: Sequence[int] = _DEFAULT_REPETITIONS,
     adiabatic_safe_factor: float | None = None,
     max_amplitude: float = 1.0,
     x180: TargetMap[Waveform] | Waveform | None = None,
@@ -181,10 +186,12 @@ def calibrate_pi_pair_rotary_zx90(
     """
     Calibrate the CR amplitude of a pi-pair rotary-echo ZX90 gate.
 
-    Four target-Z traces are measured from initial states 00, 01, 10, and 11.
-    All measured sign-changing intervals of
-    `(z00 - z01 + z10 - z11) / 4` are linearly interpolated, and the root
-    nearest the amplitude predicted from the stored ZX rotation rate is used.
+    The control is prepared in state 0. For each requested odd repetition
+    count, target-Z traces are measured with the target prepared in states 0
+    and 1, and their half-difference defines `S_N`. All traces are jointly fit
+    to `S_N(A) = C_N cos[N(pi/2 + k(A - A_0))]`, where the ZX90 amplitude
+    `A_0` and angle slope `k` are shared and each repetition has an independent
+    contrast `C_N`.
 
     Parameters
     ----------
@@ -199,12 +206,15 @@ def calibrate_pi_pair_rotary_zx90(
         is predicted and enlarged as needed for the pi-pair geometry.
     amplitude_range
         Optional strictly increasing positive absolute CR amplitudes within
-        the configured safe limit. Defaults to 17 points spanning +/-16%
+        the configured safe limit. Defaults to 33 points spanning +/-16%
         around the predicted amplitude.
     sweep_fraction
         Fractional half-width of the automatic sweep. Defaults to `0.16`.
     sweep_points
-        Number of automatic sweep points. Defaults to `17`.
+        Number of automatic sweep points. Defaults to `33`.
+    repetitions
+        Strictly increasing positive odd gate repetition counts. Defaults to
+        `(1, 3, 5)`. Include `7` explicitly when coherence permits.
     adiabatic_safe_factor
         Maximum CR Rabi rate as a fraction of control-target detuning.
         Defaults to `0.75`.
@@ -219,26 +229,31 @@ def calibrate_pi_pair_rotary_zx90(
     interval
         Shot interval in ns. Defaults to the experiment-wide default.
     plot
-        Whether to display the zero-crossing plot.
+        Whether to display the repeated-gate joint fit and final pulse schedule.
 
     Returns
     -------
     Result
-        Measurements, fit diagnostics, calibration mapping, and final schedule.
+        A result containing repetition-indexed measurements and fitted signals,
+        joint-fit diagnostics, the calibration mapping, a coherence-limit
+        estimate when T1/T2 data are available, and the final pulse schedule.
 
     Raises
     ------
     ValueError
         If stored CR data, timing, sweep bounds, pulse amplitudes, measurements,
-        or the measured zero crossing are invalid.
+        or the repeated-gate joint fit is invalid.
     TypeError
         If an input has an incompatible scalar, array, waveform, or mapping
         type.
 
     Notes
     -----
-    This function performs hardware measurements but does not update the
-    ordinary CR calibration note.
+    This function performs `2 * len(repetitions)` hardware sweeps but does not
+    update the ordinary CR calibration note. A fit whose `A_0` is constrained
+    to a sweep boundary is rejected because it does not establish an in-range
+    ZX90 point. The reported `rotary_amplitude` is the peak absolute sample
+    amplitude of the calibrated target X180 waveform.
     """
     _validate_qubit_labels(control_qubit, target_qubit)
     if not isinstance(plot, (bool, np.bool_)):
@@ -247,6 +262,7 @@ def calibrate_pi_pair_rotary_zx90(
     if fraction >= 1.0:
         raise ValueError("sweep_fraction must be less than one.")
     points = _as_integer_at_least(sweep_points, minimum=2, name="sweep_points")
+    resolved_repetitions = _resolve_repetitions(repetitions)
     resolved_shots = (
         CALIBRATION_SHOTS
         if shots is None
@@ -317,63 +333,72 @@ def calibrate_pi_pair_rotary_zx90(
             x180_margin=x180_margin,
         )
 
-    state_pairs = (("0", "0"), ("0", "1"), ("1", "0"), ("1", "1"))
-    state_values = np.empty((4, amplitudes.size), dtype=np.float64)
-    raw_results: list[Any] = []
+    state_values: dict[int, NDArray[np.float64]] = {}
+    signals: dict[int, NDArray[np.float64]] = {}
+    raw_results: dict[int, tuple[Any, ...]] = {}
+    for repetition in resolved_repetitions:
+        repeated_state_values = np.empty((2, amplitudes.size), dtype=np.float64)
+        repeated_raw_results: list[Any] = []
 
-    def sequence(candidate: float) -> PulseSchedule:
-        return pi_pair_rotary_zx90(
-            exp,
-            control_qubit,
-            target_qubit,
-            cr_amplitude=float(candidate),
-            duration=resolved_duration,
-            x180=x180,
-            x180_margin=x180_margin,
-        )
-
-    for index, (control_state, target_state) in enumerate(state_pairs):
-        measured = exp.measurement_service.sweep_parameter(
-            sequence=sequence,
-            sweep_range=amplitudes,
-            initial_states={
-                control_qubit: control_state,
-                target_qubit: target_state,
-            },
-            n_shots=resolved_shots,
-            shot_interval=resolved_interval,
-            plot=False,
-            title=f"Pi-pair rotary ZX90 calibration: {control_qubit}-{target_qubit}",
-            xlabel="CR amplitude (arb. units)",
-            ylabel="Normalized target Z",
-        )
-        raw_results.append(measured)
-        if target_qubit not in measured.data:
-            raise ValueError(
-                f"Calibration measurement is missing target `{target_qubit}`."
+        def sequence(candidate: float, repetition: int = repetition) -> PulseSchedule:
+            gate = pi_pair_rotary_zx90(
+                exp,
+                control_qubit,
+                target_qubit,
+                cr_amplitude=float(candidate),
+                duration=resolved_duration,
+                x180=x180,
+                x180_margin=x180_margin,
             )
-        values = _as_finite_vector(
-            measured.data[target_qubit].normalized,
-            name="normalized target-Z measurement",
-        )
-        if values.shape != amplitudes.shape:
-            raise ValueError(
-                "Each state measurement must return one value per amplitude."
-            )
-        state_values[index] = values
+            return gate.repeated(repetition)
 
-    z00, z01, z10, z11 = state_values
-    s_zx = (z00 - z01 + z10 - z11) / 4.0
-    s_ix_from_z = (z00 - z01 - z10 + z11) / 4.0
-    slope, intercept, root, root_bracket, fitted = _nearest_zero_crossing(
+        for state_index, target_state in enumerate(_TARGET_STATES):
+            measured = exp.measurement_service.sweep_parameter(
+                sequence=sequence,
+                sweep_range=amplitudes,
+                initial_states={
+                    control_qubit: "0",
+                    target_qubit: target_state,
+                },
+                n_shots=resolved_shots,
+                shot_interval=resolved_interval,
+                plot=False,
+                title=(
+                    "Pi-pair rotary ZX90 calibration: "
+                    f"{control_qubit}-{target_qubit} (N={repetition})"
+                ),
+                xlabel="CR amplitude (arb. units)",
+                ylabel="Normalized target Z",
+            )
+            repeated_raw_results.append(measured)
+            if target_qubit not in measured.data:
+                raise ValueError(
+                    f"Calibration measurement is missing target `{target_qubit}`."
+                )
+            values = _as_finite_vector(
+                measured.data[target_qubit].normalized,
+                name="normalized target-Z measurement",
+            )
+            if values.shape != amplitudes.shape:
+                raise ValueError(
+                    "Each state measurement must return one value per amplitude."
+                )
+            repeated_state_values[state_index] = values
+
+        state_values[repetition] = repeated_state_values
+        signals[repetition] = (
+            repeated_state_values[0] - repeated_state_values[1]
+        ) / 2.0
+        raw_results[repetition] = tuple(repeated_raw_results)
+
+    fit = _fit_repeated_gate_signals(
         amplitudes,
-        s_zx,
-        reference=predicted,
+        signals,
+        repetitions=resolved_repetitions,
+        predicted_amplitude=predicted,
     )
-    if root <= 0.0 or root > max_cr_amplitude + _TOLERANCE:
-        raise ValueError(
-            "The interpolated ZX90 root is outside the safe amplitude range."
-        )
+    root = float(fit["zx90_amplitude"])
+    fit_range = (float(amplitudes[0]), float(amplitudes[-1]))
 
     final_schedule = pi_pair_rotary_zx90(
         exp,
@@ -385,6 +410,7 @@ def calibrate_pi_pair_rotary_zx90(
         x180_margin=x180_margin,
     )
     cancel_amplitude = params["cancel_amplitude"] * root / params["cr_amplitude"]
+    rotary_amplitude = float(np.max(np.abs(target_pi.values)))
     calibration = {
         "status": "completed",
         "control_qubit": control_qubit,
@@ -397,36 +423,53 @@ def calibrate_pi_pair_rotary_zx90(
         "cancel_amplitude": cancel_amplitude,
         "cancel_phase": params["cancel_phase"],
         "cancel_beta": params["cancel_beta"],
+        "rotary_amplitude": rotary_amplitude,
         "predicted_cr_amplitude": predicted,
         "max_cr_amplitude": max_cr_amplitude,
         "sampling_period": sampling_period,
         "x180_margin": float(x180_margin),
+        "angle_slope": fit["angle_slope"],
+        "contrasts": fit["contrasts"],
+        "repetitions": resolved_repetitions,
     }
+    coherence_limit = _calculate_coherence_limit(
+        exp,
+        control_qubit,
+        target_qubit,
+        gate_time=final_schedule.duration,
+    )
+    _print_calibrated_parameters(calibration)
+    _print_joint_fit(fit)
+    if coherence_limit:
+        _print_coherence_limit(coherence_limit)
     figure = _plot_calibration(
         amplitudes,
-        s_zx,
-        fitted,
+        signals,
+        fit["fitted_signals"],
         root=root,
-        root_bracket=root_bracket,
         control_qubit=control_qubit,
         target_qubit=target_qubit,
     )
     if plot:
         figure.show()
+        final_schedule.plot(
+            title=f"Pi-pair rotary ZX90 sequence : {control_qubit}-{target_qubit}",
+            show_physical_pulse=True,
+        )
     return Result(
         data={
             "pi_pair_rotary_zx90_calibration": calibration,
             "amplitude_range": amplitudes,
+            "target_state_order": _TARGET_STATES,
             "state_values": state_values,
-            "s_zx": s_zx,
-            "s_ix_from_z": s_ix_from_z,
-            "fit_slope": slope,
-            "fit_intercept": intercept,
-            "fitted_signal": fitted,
+            "signals": signals,
+            "fitted_signals": fit["fitted_signals"],
+            "fit": fit,
             "root": root,
-            "root_bracket": root_bracket,
-            "raw_results": tuple(raw_results),
+            "fit_range": fit_range,
+            "raw_results": raw_results,
             "pulse_schedule": final_schedule,
+            "coherence_limit": coherence_limit,
         },
         figure=figure,
     )
@@ -631,109 +674,304 @@ def _resolve_amplitude_range(
     return result
 
 
-def _nearest_zero_crossing(
-    amplitudes: NDArray[np.float64],
-    signal: NDArray[np.float64],
-    *,
-    reference: float,
-) -> tuple[float, float, float, tuple[float, float], NDArray[np.float64]]:
-    """Interpolate every measured crossing and select the nearest reference."""
-    candidates: list[tuple[float, float, float, tuple[float, float]]] = []
-
-    for index in np.flatnonzero(signal == 0.0):
-        neighbor = index - 1 if index > 0 else index + 1
-        neighbor_amplitude = float(amplitudes[neighbor])
-        neighbor_signal = float(signal[neighbor])
-        crossing_amplitude = float(amplitudes[index])
-        crossing_signal = float(signal[index])
-        slope, intercept = _line_through_samples(
-            neighbor_amplitude,
-            neighbor_signal,
-            crossing_amplitude,
-            crossing_signal,
-        )
-        bracket = (
-            min(neighbor_amplitude, crossing_amplitude),
-            max(neighbor_amplitude, crossing_amplitude),
-        )
-        candidates.append(
-            (
-                crossing_amplitude,
-                slope,
-                intercept,
-                bracket,
-            )
-        )
-
-    for index in range(amplitudes.size - 1):
-        if signal[index] * signal[index + 1] >= 0.0:
-            continue
-        slope, intercept = _line_through_samples(
-            amplitudes[index],
-            signal[index],
-            amplitudes[index + 1],
-            signal[index + 1],
-        )
-        root = float(-intercept / slope)
-        candidates.append(
-            (
-                root,
-                slope,
-                intercept,
-                (float(amplitudes[index]), float(amplitudes[index + 1])),
-            )
-        )
-
-    if not candidates:
-        raise ValueError("S_ZX has no zero crossing in the measured sweep range.")
-    root, slope, intercept, bracket = min(
-        candidates,
-        key=lambda candidate: abs(candidate[0] - reference),
+def _resolve_repetitions(values: Sequence[int]) -> tuple[int, ...]:
+    """Validate repeated-gate counts and return an immutable sequence."""
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+        raise TypeError("repetitions must be a sequence of integers.")
+    result = tuple(
+        _as_integer_at_least(value, minimum=1, name="repetitions entry")
+        for value in values
     )
-    return slope, intercept, root, bracket, slope * amplitudes + intercept
+    if not result:
+        raise ValueError("repetitions must contain at least one value.")
+    if any(value % 2 == 0 for value in result):
+        raise ValueError("repetitions must contain only odd integers.")
+    if any(left >= right for left, right in pairwise(result)):
+        raise ValueError("repetitions must be strictly increasing and unique.")
+    return result
 
 
-def _line_through_samples(
-    x0: float,
-    y0: float,
-    x1: float,
-    y1: float,
-) -> tuple[float, float]:
-    """Return the line through two distinct measured samples."""
-    slope = float((y1 - y0) / (x1 - x0))
-    if not np.isfinite(slope) or abs(slope) < _MIN_SLOPE:
-        raise ValueError("The measured ZX zero-crossing slope is too small.")
-    intercept = float(y0 - slope * x0)
-    return slope, intercept
+def _fit_repeated_gate_signals(
+    amplitudes: NDArray[np.float64],
+    signals: Mapping[int, NDArray[np.float64]],
+    *,
+    repetitions: tuple[int, ...],
+    predicted_amplitude: float,
+) -> dict[str, Any]:
+    """Jointly fit repeated-gate signals to one ZX90 amplitude and slope."""
+    signal_variation = max(float(np.ptp(signals[value])) for value in repetitions)
+    if signal_variation <= 10.0 * np.finfo(float).eps:
+        raise ValueError(
+            "Repeated-gate joint fit is not identifiable from flat measured signals."
+        )
+    angle_slope_initial = np.pi / (2.0 * predicted_amplitude)
+    initial_contrasts: list[float] = []
+    for repetition in repetitions:
+        basis = np.cos(
+            repetition
+            * (np.pi / 2.0 + angle_slope_initial * (amplitudes - predicted_amplitude))
+        )
+        denominator = float(np.dot(basis, basis))
+        contrast = (
+            float(np.dot(signals[repetition], basis) / denominator)
+            if denominator > 0.0
+            else 1.0
+        )
+        initial_contrasts.append(float(np.clip(contrast, 0.05, 1.0)))
+
+    def residuals(parameters: NDArray[np.float64]) -> NDArray[np.float64]:
+        zx90_amplitude = float(parameters[0])
+        angle_slope = float(parameters[1])
+        return np.concatenate(
+            [
+                _repeated_gate_model(
+                    amplitudes,
+                    repetition=repetition,
+                    zx90_amplitude=zx90_amplitude,
+                    angle_slope=angle_slope,
+                    contrast=float(parameters[index + 2]),
+                )
+                - signals[repetition]
+                for index, repetition in enumerate(repetitions)
+            ]
+        )
+
+    lower_amplitude = float(amplitudes[0])
+    upper_amplitude = float(amplitudes[-1])
+    amplitude_epsilon = np.finfo(float).eps * max(1.0, abs(predicted_amplitude))
+    initial_amplitude = float(
+        np.clip(
+            predicted_amplitude,
+            lower_amplitude + amplitude_epsilon,
+            upper_amplitude - amplitude_epsilon,
+        )
+    )
+    initial = np.asarray(
+        [initial_amplitude, angle_slope_initial, *initial_contrasts],
+        dtype=np.float64,
+    )
+    lower_bounds = np.asarray(
+        [lower_amplitude, 0.0, *([0.0] * len(repetitions))],
+        dtype=np.float64,
+    )
+    upper_bounds = np.asarray(
+        [
+            upper_amplitude,
+            4.0 * angle_slope_initial,
+            *([1.2] * len(repetitions)),
+        ],
+        dtype=np.float64,
+    )
+    result = least_squares(
+        residuals,
+        initial,
+        bounds=(lower_bounds, upper_bounds),
+        max_nfev=10_000,
+    )
+    if not result.success or not np.all(np.isfinite(result.x)):
+        raise ValueError(f"Repeated-gate joint fit failed: {result.message}")
+    if result.active_mask[0] != 0:
+        raise ValueError(
+            "The fitted ZX90 amplitude is constrained to a sweep boundary; "
+            "expand or recenter amplitude_range."
+        )
+
+    zx90_amplitude = float(result.x[0])
+    angle_slope = float(result.x[1])
+    contrasts = {
+        repetition: float(result.x[index + 2])
+        for index, repetition in enumerate(repetitions)
+    }
+    fitted_signals = {
+        repetition: _repeated_gate_model(
+            amplitudes,
+            repetition=repetition,
+            zx90_amplitude=zx90_amplitude,
+            angle_slope=angle_slope,
+            contrast=contrasts[repetition],
+        )
+        for repetition in repetitions
+    }
+    residual_vector = residuals(result.x)
+    jacobian = np.asarray(result.jac, dtype=np.float64)
+    if np.linalg.matrix_rank(jacobian) < result.x.size:
+        raise ValueError(
+            "Repeated-gate joint fit is not identifiable from the measured signals."
+        )
+    residual_rms = float(np.sqrt(np.mean(np.square(residual_vector))))
+    amplitude_stderr = _parameter_standard_error(
+        jacobian,
+        residual_vector,
+        parameter_index=0,
+    )
+    return {
+        "success": True,
+        "message": str(result.message),
+        "zx90_amplitude": zx90_amplitude,
+        "angle_slope": angle_slope,
+        "contrasts": contrasts,
+        "amplitude_stderr": amplitude_stderr,
+        "residual_rms": residual_rms,
+        "cost": float(result.cost),
+        "nfev": int(result.nfev),
+        "repetitions": repetitions,
+        "fitted_signals": fitted_signals,
+    }
+
+
+def _repeated_gate_model(
+    amplitudes: NDArray[np.float64],
+    *,
+    repetition: int,
+    zx90_amplitude: float,
+    angle_slope: float,
+    contrast: float,
+) -> NDArray[np.float64]:
+    """Evaluate one repeated-gate calibration signal."""
+    angle = np.pi / 2.0 + angle_slope * (amplitudes - zx90_amplitude)
+    return contrast * np.cos(repetition * angle)
+
+
+def _parameter_standard_error(
+    jacobian: NDArray[np.float64],
+    residuals: NDArray[np.float64],
+    *,
+    parameter_index: int,
+) -> float:
+    """Estimate one parameter standard error from the fit Jacobian."""
+    degrees_of_freedom = residuals.size - jacobian.shape[1]
+    if degrees_of_freedom <= 0:
+        return float("nan")
+    residual_variance = float(np.dot(residuals, residuals) / degrees_of_freedom)
+    covariance = np.linalg.pinv(jacobian.T @ jacobian) * residual_variance
+    variance = float(covariance[parameter_index, parameter_index])
+    return float(np.sqrt(max(variance, 0.0)))
 
 
 def _plot_calibration(
     amplitudes: NDArray[np.float64],
-    signal: NDArray[np.float64],
-    fitted: NDArray[np.float64],
+    signals: Mapping[int, NDArray[np.float64]],
+    fitted_signals: Mapping[int, NDArray[np.float64]],
     *,
     root: float,
-    root_bracket: tuple[float, float],
     control_qubit: str,
     target_qubit: str,
 ) -> go.Figure:
     figure = make_figure()
-    figure.add_scatter(x=amplitudes, y=signal, mode="markers", name="S_ZX")
-    bracket = np.asarray(root_bracket)
-    bracket_indices = np.searchsorted(amplitudes, bracket)
-    figure.add_scatter(
-        x=bracket,
-        y=fitted[bracket_indices],
-        mode="lines",
-        name="local interpolation",
+    colors = ("#636EFA", "#EF553B", "#00CC96", "#AB63FA")
+    for index, repetition in enumerate(signals):
+        color = colors[index % len(colors)]
+        figure.add_scatter(
+            x=amplitudes,
+            y=signals[repetition],
+            mode="markers",
+            name=f"S_{repetition} data",
+            marker={"color": color},
+        )
+        figure.add_scatter(
+            x=amplitudes,
+            y=fitted_signals[repetition],
+            mode="lines",
+            name=f"N={repetition} fit",
+            line={"color": color},
+        )
+    figure.add_annotation(
+        x=root,
+        y=0.0,
+        text=f"ZX90 amplitude: {root:.6g}",
+        showarrow=True,
+        arrowhead=1,
     )
-    figure.add_vline(x=root, line_dash="dash")
     figure.update_layout(
-        title=f"Pi-pair rotary ZX90 calibration: {control_qubit}-{target_qubit}",
-        xaxis_title="CR amplitude (arb. units)",
-        yaxis_title="S_ZX",
+        title=f"Pi-pair rotary ZX90 calibration : {control_qubit}-{target_qubit}",
+        xaxis_title="Amplitude (arb. units)",
+        yaxis_title="Repeated-gate signal S_N",
     )
     return figure
+
+
+def _calculate_coherence_limit(
+    exp: Experiment,
+    control_qubit: str,
+    target_qubit: str,
+    *,
+    gate_time: float,
+) -> dict[str, float | str]:
+    """Calculate the coherence limit using the emitted schedule duration."""
+    try:
+        config_loader = exp.ctx.system_manager.config_loader
+        t1_data = config_loader.load_param_data("t1")
+        t2_data = config_loader.load_param_data("t2_echo")
+        t1 = (
+            _as_positive_float(t1_data[control_qubit], name="control T1"),
+            _as_positive_float(t1_data[target_qubit], name="target T1"),
+        )
+        t2 = (
+            _as_positive_float(t2_data[control_qubit], name="control echo T2"),
+            _as_positive_float(t2_data[target_qubit], name="target echo T2"),
+        )
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return {}
+
+    duration = _as_positive_float(gate_time, name="ZX90 gate time")
+    return {
+        "control_qubit": control_qubit,
+        "target_qubit": target_qubit,
+        "gate_time": duration,
+        "t1_control": t1[0],
+        "t1_target": t1[1],
+        "t2_control": t2[0],
+        "t2_target": t2[1],
+        **util.calc_2q_gate_coherence_limit(
+            gate_time=duration,
+            t1=t1,
+            t2=t2,
+        ),
+    }
+
+
+def _print_calibrated_parameters(calibration: Mapping[str, Any]) -> None:
+    """Print the calibrated pi-pair rotary ZX90 parameters."""
+    print()
+    print("Calibrated CR parameters:")
+    print(f"  CR duration      : {float(calibration['duration']):.1f} ns")
+    print(f"  CR ramptime      : {float(calibration['ramptime']):.1f} ns")
+    print(f"  CR amplitude     : {float(calibration['cr_amplitude']):.6f}")
+    print(f"  CR phase         : {float(calibration['cr_phase']):.6f}")
+    print(f"  CR beta          : {float(calibration['cr_beta']):.6f}")
+    print(f"  Cancel amplitude : {float(calibration['cancel_amplitude']):.6f}")
+    print(f"  Cancel phase     : {float(calibration['cancel_phase']):.6f}")
+    print(f"  Cancel beta      : {float(calibration['cancel_beta']):.6f}")
+    print(f"  Rotary amplitude : {float(calibration['rotary_amplitude']):.6f}")
+    print()
+
+
+def _print_joint_fit(fit: Mapping[str, Any]) -> None:
+    """Print repeated-gate joint-fit parameters."""
+    repetitions = tuple(int(value) for value in fit["repetitions"])
+    contrasts = fit["contrasts"]
+    if not isinstance(contrasts, Mapping):
+        raise TypeError("fit contrasts must be a mapping.")
+    print("Repeated-gate joint fit:")
+    print(f"  Repetitions      : {', '.join(str(value) for value in repetitions)}")
+    print(f"  Angle slope      : {float(fit['angle_slope']):.6f} rad / amplitude")
+    for repetition in repetitions:
+        print(f"  Contrast (N={repetition})  : {float(contrasts[repetition]):.6f}")
+    print(f"  Amplitude stderr : {float(fit['amplitude_stderr']):.6g}")
+    print(f"  Residual RMS     : {float(fit['residual_rms']):.6g}")
+    print()
+
+
+def _print_coherence_limit(coherence_limit: Mapping[str, float | str]) -> None:
+    """Print the pi-pair rotary ZX90 coherence-limit estimate."""
+    print("ZX90 coherence limit:")
+    print(f"  Gate time       : {float(coherence_limit['gate_time']):.0f} ns")
+    print(f"  T1 (control)    : {float(coherence_limit['t1_control']) * 1e-3:.1f} μs")
+    print(f"  T1 (target)     : {float(coherence_limit['t1_target']) * 1e-3:.1f} μs")
+    print(f"  T2 (control)    : {float(coherence_limit['t2_control']) * 1e-3:.1f} μs")
+    print(f"  T2 (target)     : {float(coherence_limit['t2_target']) * 1e-3:.1f} μs")
+    print(f"  Coherence limit : {float(coherence_limit['fidelity']) * 100:.2f} %")
+    print()
 
 
 def _validate_waveform(

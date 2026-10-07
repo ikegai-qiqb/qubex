@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
+import plotly.graph_objects as go
 import pytest
 from numpy.testing import assert_allclose
 
@@ -15,7 +16,7 @@ from qubex.contrib import (
     pi_pair_rotary_zx90,
 )
 from qubex.experiment.models import Result
-from qubex.pulse import Rect
+from qubex.pulse import PulseSchedule, Rect
 
 
 class _CalibrationNote:
@@ -24,6 +25,15 @@ class _CalibrationNote:
 
     def get_cr_param(self, _label: str, **_kwargs: Any) -> dict[str, float]:
         return self.params
+
+
+class _ConfigLoader:
+    def load_param_data(self, name: str) -> dict[str, float]:
+        if name == "t1":
+            return {"Q0": 169_100.0, "Q1": 80_800.0}
+        if name == "t2_echo":
+            return {"Q0": 53_500.0, "Q1": 57_000.0}
+        raise KeyError(name)
 
 
 class _PulseService:
@@ -46,21 +56,30 @@ class _MeasurementService:
         self,
         *,
         root: float,
-        signal_function: Callable[[np.ndarray], np.ndarray] | None = None,
+        angle_slope: float | None = None,
+        contrasts: dict[int, float] | None = None,
+        signal_function: Callable[[np.ndarray, int], np.ndarray] | None = None,
     ) -> None:
         self.root = root
+        self.angle_slope = angle_slope or np.pi / (2.0 * root)
+        self.contrasts = contrasts or {1: 0.95, 3: 0.8, 5: 0.65, 7: 0.5}
         self.signal_function = signal_function
         self.calls: list[dict[str, Any]] = []
 
     def sweep_parameter(self, **kwargs: Any) -> Result:
         self.calls.append(kwargs)
         amplitudes = np.asarray(kwargs["sweep_range"], dtype=float)
+        repetition = int(kwargs["title"].rsplit("N=", maxsplit=1)[1].rstrip(")"))
+        assert kwargs["initial_states"]["Q0"] == "0"
         target_state = kwargs["initial_states"]["Q1"]
         sign = 1.0 if target_state == "0" else -1.0
         base_signal = (
-            amplitudes - self.root
+            self.contrasts[repetition]
+            * np.cos(
+                repetition * (np.pi / 2.0 + self.angle_slope * (amplitudes - self.root))
+            )
             if self.signal_function is None
-            else self.signal_function(amplitudes)
+            else self.signal_function(amplitudes, repetition)
         )
         signal = sign * base_signal
         return Result(data={"Q1": SimpleNamespace(normalized=signal)})
@@ -71,9 +90,11 @@ class _Experiment:
         self,
         *,
         root: float = 0.5,
+        angle_slope: float | None = None,
+        contrasts: dict[int, float] | None = None,
         pi_amplitude: float = 0.25,
         cancel_amplitude: float = 0.08,
-        signal_function: Callable[[np.ndarray], np.ndarray] | None = None,
+        signal_function: Callable[[np.ndarray, int], np.ndarray] | None = None,
     ) -> None:
         rate = 1.0 / (8.0 * root * (128.0 - 8.0))
         params = {
@@ -90,6 +111,8 @@ class _Experiment:
         self.pulse = _PulseService(pi_amplitude=pi_amplitude)
         self.measurement_service = _MeasurementService(
             root=root,
+            angle_slope=angle_slope,
+            contrasts=contrasts,
             signal_function=signal_function,
         )
         self.ctx = SimpleNamespace(
@@ -102,12 +125,14 @@ class _Experiment:
                 "Q1": SimpleNamespace(frequency=5.2),
             },
             experiment_system=None,
+            system_manager=SimpleNamespace(config_loader=_ConfigLoader()),
         )
 
 
-def test_calibration_uses_default_four_state_sweep_and_finds_zx90_root() -> None:
-    """The default calibration should fit the four-state ZX zero crossing."""
-    exp = _Experiment(root=0.5)
+def test_calibration_uses_default_repeated_gate_sweeps_and_finds_zx90() -> None:
+    """The default calibration should jointly fit N=1,3,5 target-state signals."""
+    contrasts = {1: 0.95, 3: 0.8, 5: 0.65}
+    exp = _Experiment(root=0.5, angle_slope=3.2, contrasts=contrasts)
 
     result = calibrate_pi_pair_rotary_zx90(
         exp,  # type: ignore[arg-type]
@@ -125,18 +150,29 @@ def test_calibration_uses_default_four_state_sweep_and_finds_zx90_root() -> None
     assert calibration["cancel_amplitude"] == pytest.approx(0.1, abs=1e-12)
     assert_allclose(
         result.data["amplitude_range"],
-        np.linspace(0.42, 0.58, 17),
+        np.linspace(0.42, 0.58, 33),
         rtol=0.0,
         atol=1e-12,
     )
-    assert_allclose(result.data["s_zx"], np.linspace(-0.08, 0.08, 17))
-    assert len(exp.measurement_service.calls) == 4
+    assert calibration["angle_slope"] == pytest.approx(3.2, abs=1e-8)
+    assert calibration["contrasts"] == pytest.approx(contrasts, abs=1e-8)
+    assert calibration["repetitions"] == (1, 3, 5)
+    assert result.data["target_state_order"] == ("0", "1")
+    assert set(result.data["signals"]) == {1, 3, 5}
+    assert len(exp.measurement_service.calls) == 6
     assert [call["initial_states"] for call in exp.measurement_service.calls] == [
         {"Q0": "0", "Q1": "0"},
         {"Q0": "0", "Q1": "1"},
-        {"Q0": "1", "Q1": "0"},
-        {"Q0": "1", "Q1": "1"},
+        {"Q0": "0", "Q1": "0"},
+        {"Q0": "0", "Q1": "1"},
+        {"Q0": "0", "Q1": "0"},
+        {"Q0": "0", "Q1": "1"},
     ]
+    for repetition, call in zip(
+        (1, 3, 5), exp.measurement_service.calls[::2], strict=True
+    ):
+        schedule = call["sequence"](0.5)
+        assert schedule.duration == pytest.approx(288.0 * repetition, abs=1e-12)
 
 
 def test_pi_pair_schedule_places_signed_pi_pulses_in_each_half() -> None:
@@ -171,26 +207,71 @@ def test_pi_pair_schedule_places_signed_pi_pulses_in_each_half() -> None:
     assert_allclose(target[72:136], -first_half, rtol=0.0, atol=1e-12)
 
 
-def test_calibration_selects_zero_crossing_nearest_prediction() -> None:
-    """Multiple crossings should resolve to the one nearest the predicted amplitude."""
-    exp = _Experiment(
-        root=0.5,
-        signal_function=lambda amplitude: (
-            (amplitude - 0.44) * (amplitude - 0.52) * (amplitude - 0.56)
-        ),
-    )
+def test_calibration_accepts_explicit_n7_repetition() -> None:
+    """An explicit N=7 request should participate in the joint fit."""
+    exp = _Experiment(root=0.5)
 
     result = calibrate_pi_pair_rotary_zx90(
         exp,  # type: ignore[arg-type]
         "Q0",
         "Q1",
         duration=128.0,
-        amplitude_range=np.linspace(0.4, 0.6, 11),
+        repetitions=(1, 3, 5, 7),
         plot=False,
     )
 
-    assert result.data["root"] == pytest.approx(0.52, abs=1e-12)
-    assert result.data["root_bracket"] == pytest.approx((0.5, 0.52), abs=1e-12)
+    assert result.data["fit"]["repetitions"] == (1, 3, 5, 7)
+    assert set(result.data["signals"]) == {1, 3, 5, 7}
+    assert len(exp.measurement_service.calls) == 8
+
+
+def test_calibration_rejects_unidentifiable_joint_fit() -> None:
+    """Flat zero-contrast traces should not produce an arbitrary calibration."""
+    exp = _Experiment(
+        signal_function=lambda amplitudes, _repetition: np.zeros_like(amplitudes)
+    )
+
+    with pytest.raises(ValueError, match="not identifiable"):
+        calibrate_pi_pair_rotary_zx90(
+            exp,  # type: ignore[arg-type]
+            "Q0",
+            "Q1",
+            duration=128.0,
+            plot=False,
+        )
+
+
+def test_calibration_rejects_zx90_amplitude_at_sweep_boundary() -> None:
+    """A boundary-constrained amplitude should not be accepted as calibrated."""
+    exp = _Experiment(root=0.5)
+    exp.measurement_service.root = 0.62
+
+    with pytest.raises(ValueError, match="sweep boundary"):
+        calibrate_pi_pair_rotary_zx90(
+            exp,  # type: ignore[arg-type]
+            "Q0",
+            "Q1",
+            duration=128.0,
+            plot=False,
+        )
+
+
+@pytest.mark.parametrize("repetitions", [(), (1, 2, 3), (1, 3, 3), (3, 1)])
+def test_calibration_rejects_invalid_repetitions(
+    repetitions: tuple[int, ...],
+) -> None:
+    """Repetitions should be nonempty, unique, increasing positive odd integers."""
+    exp = _Experiment()
+
+    with pytest.raises((TypeError, ValueError), match="repetitions"):
+        calibrate_pi_pair_rotary_zx90(
+            exp,  # type: ignore[arg-type]
+            "Q0",
+            "Q1",
+            duration=128.0,
+            repetitions=repetitions,
+            plot=False,
+        )
 
 
 def test_calibration_predicts_aligned_duration_and_recenters_amplitude() -> None:
@@ -199,6 +280,7 @@ def test_calibration_predicts_aligned_duration_and_recenters_amplitude() -> None
     rate = exp.ctx.calib_note.params["zx_rotation_rate"]
     aligned_root = 1.0 / (8.0 * rate * (160.0 - 8.0))
     exp.measurement_service.root = aligned_root
+    exp.measurement_service.angle_slope = np.pi / (2.0 * aligned_root)
 
     result = calibrate_pi_pair_rotary_zx90(
         exp,  # type: ignore[arg-type]
@@ -260,7 +342,7 @@ def test_default_sweep_preserves_width_below_safe_upper_limit() -> None:
 
     assert_allclose(
         result.data["amplitude_range"],
-        np.linspace(0.39, 0.55, 17),
+        np.linspace(0.39, 0.55, 33),
         rtol=0.0,
         atol=1e-12,
     )
@@ -294,3 +376,45 @@ def test_calibration_validates_composite_waveforms_before_measurement() -> None:
         )
 
     assert exp.measurement_service.calls == []
+
+
+def test_calibration_prints_summary_and_plots_fit_and_schedule(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Successful calibration should show its fit, schedule, and text summary."""
+    exp = _Experiment(root=0.5)
+    shown_figures: list[go.Figure] = []
+    schedule_plots: list[dict[str, Any]] = []
+    monkeypatch.setattr(go.Figure, "show", lambda figure: shown_figures.append(figure))
+    monkeypatch.setattr(
+        PulseSchedule,
+        "plot",
+        lambda _schedule, **kwargs: schedule_plots.append(kwargs),
+    )
+
+    result = calibrate_pi_pair_rotary_zx90(
+        exp,  # type: ignore[arg-type]
+        "Q0",
+        "Q1",
+        duration=128.0,
+        plot=True,
+    )
+
+    output = capsys.readouterr().out
+    assert "Calibrated CR parameters:" in output
+    assert "Rotary amplitude" in output
+    assert "ZX90 coherence limit:" in output
+    assert result.figure is shown_figures[0]
+    assert result.figure.layout.annotations[0].showarrow is True
+    assert len(result.figure.data) == 6
+    assert schedule_plots == [
+        {
+            "title": "Pi-pair rotary ZX90 sequence : Q0-Q1",
+            "show_physical_pulse": True,
+        }
+    ]
+    assert result.data["coherence_limit"]["gate_time"] == pytest.approx(
+        result.data["pulse_schedule"].duration,
+        abs=1e-12,
+    )
