@@ -43,6 +43,7 @@ def pi_pair_rotary_zx90(
     cr_amplitude: float,
     duration: float,
     x180: TargetMap[Waveform] | Waveform | None = None,
+    rotary_x180: TargetMap[Waveform] | Waveform | None = None,
     x180_margin: float = 0.0,
 ) -> PulseSchedule:
     """
@@ -66,7 +67,12 @@ def pi_pair_rotary_zx90(
         Duration of one CR half in ns. It must leave four equal blank regions,
         each at least as long as the CR ramp, around four target X180 pulses.
     x180
-        Optional control X180 waveform or target mapping.
+        Optional control-qubit X180 waveform or target mapping used for the
+        echoed-CR refocusing pulses.
+    rotary_x180
+        Optional target-qubit X180 waveform or target mapping used for the
+        pi-pair rotary pulses. Defaults to the calibrated non-DRAG pulse from
+        `exp.pulse.get_pi_pulse(target_qubit)`.
     x180_margin
         Zero-amplitude margin before and after each control X180 in ns. It must
         align to the experiment sampling period.
@@ -90,8 +96,8 @@ def pi_pair_rotary_zx90(
     margin = _as_nonnegative_float(x180_margin, name="x180_margin")
     sampling_period = _sampling_period(exp)
     params = _load_cr_params(exp, control_qubit, target_qubit)
-    target_pi = exp.pulse.x180(target_qubit)
-    control_pi = _resolve_x180(exp, control_qubit, x180)
+    target_pi = _resolve_rotary_x180(exp, target_qubit, rotary_x180)
+    control_pi = _resolve_control_x180(exp, control_qubit, x180)
     _validate_waveform(target_pi, sampling_period=sampling_period, name="target X180")
     _validate_waveform(control_pi, sampling_period=sampling_period, name="control X180")
     _require_aligned(half_duration, sampling_period, name="duration")
@@ -178,6 +184,7 @@ def calibrate_pi_pair_rotary_zx90(
     adiabatic_safe_factor: float | None = None,
     max_amplitude: float = 1.0,
     x180: TargetMap[Waveform] | Waveform | None = None,
+    rotary_x180: TargetMap[Waveform] | Waveform | None = None,
     x180_margin: float = 0.0,
     shots: int | None = None,
     interval: float | None = None,
@@ -221,7 +228,12 @@ def calibrate_pi_pair_rotary_zx90(
     max_amplitude
         Additional upper bound on absolute CR amplitude. Defaults to `1.0`.
     x180
-        Optional control X180 waveform or target mapping.
+        Optional control-qubit X180 waveform or target mapping used for the
+        echoed-CR refocusing pulses.
+    rotary_x180
+        Optional target-qubit X180 waveform or target mapping used for the
+        pi-pair rotary pulses. Defaults to the calibrated non-DRAG pulse from
+        `exp.pulse.get_pi_pulse(target_qubit)`.
     x180_margin
         Margin around each control X180 in ns.
     shots
@@ -253,7 +265,7 @@ def calibrate_pi_pair_rotary_zx90(
     update the ordinary CR calibration note. A fit whose `A_0` is constrained
     to a sweep boundary is rejected because it does not establish an in-range
     ZX90 point. The reported `rotary_amplitude` is the peak absolute sample
-    amplitude of the calibrated target X180 waveform.
+    amplitude of the selected target rotary X180 waveform.
     """
     _validate_qubit_labels(control_qubit, target_qubit)
     if not isinstance(plot, (bool, np.bool_)):
@@ -287,7 +299,9 @@ def calibrate_pi_pair_rotary_zx90(
 
     params = _load_cr_params(exp, control_qubit, target_qubit)
     sampling_period = _sampling_period(exp)
-    target_pi = exp.pulse.x180(target_qubit)
+    control_pi = _resolve_control_x180(exp, control_qubit, x180)
+    target_pi = _resolve_rotary_x180(exp, target_qubit, rotary_x180)
+    _validate_waveform(control_pi, sampling_period=sampling_period, name="control X180")
     _validate_waveform(target_pi, sampling_period=sampling_period, name="target X180")
     resolved_duration = _resolve_duration(
         duration,
@@ -329,7 +343,8 @@ def calibrate_pi_pair_rotary_zx90(
             target_qubit,
             cr_amplitude=float(endpoint),
             duration=resolved_duration,
-            x180=x180,
+            x180=control_pi,
+            rotary_x180=target_pi,
             x180_margin=x180_margin,
         )
 
@@ -347,7 +362,8 @@ def calibrate_pi_pair_rotary_zx90(
                 target_qubit,
                 cr_amplitude=float(candidate),
                 duration=resolved_duration,
-                x180=x180,
+                x180=control_pi,
+                rotary_x180=target_pi,
                 x180_margin=x180_margin,
             )
             return gate.repeated(repetition)
@@ -406,7 +422,8 @@ def calibrate_pi_pair_rotary_zx90(
         target_qubit,
         cr_amplitude=root,
         duration=resolved_duration,
-        x180=x180,
+        x180=control_pi,
+        rotary_x180=target_pi,
         x180_margin=x180_margin,
     )
     cancel_amplitude = params["cancel_amplitude"] * root / params["cr_amplitude"]
@@ -532,11 +549,12 @@ def _sampling_period(exp: Experiment) -> float:
     return _as_positive_float(value, name="sampling_period")
 
 
-def _resolve_x180(
+def _resolve_control_x180(
     exp: Experiment,
     control_qubit: str,
     x180: TargetMap[Waveform] | Waveform | None,
 ) -> Waveform:
+    """Resolve the control X180 used by the echoed CR sequence."""
     if x180 is None:
         result = exp.pulse.x180(control_qubit)
     elif isinstance(x180, Waveform):
@@ -552,6 +570,30 @@ def _resolve_x180(
         raise TypeError("x180 must be a Waveform, a target mapping, or None.")
     if not isinstance(result, Waveform):
         raise TypeError("x180 must resolve to a Waveform.")
+    return result
+
+
+def _resolve_rotary_x180(
+    exp: Experiment,
+    target_qubit: str,
+    rotary_x180: TargetMap[Waveform] | Waveform | None,
+) -> Waveform:
+    """Resolve the target X180 used by the pi-pair rotary echo."""
+    if rotary_x180 is None:
+        result = exp.pulse.get_pi_pulse(target_qubit)
+    elif isinstance(rotary_x180, Waveform):
+        result = rotary_x180
+    elif isinstance(rotary_x180, Mapping):
+        try:
+            result = rotary_x180[target_qubit]
+        except KeyError as exc:
+            raise ValueError(
+                f"rotary_x180 mapping does not contain target qubit {target_qubit!r}."
+            ) from exc
+    else:
+        raise TypeError("rotary_x180 must be a Waveform, a target mapping, or None.")
+    if not isinstance(result, Waveform):
+        raise TypeError("rotary_x180 must resolve to a Waveform.")
     return result
 
 

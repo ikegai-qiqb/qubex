@@ -39,13 +39,20 @@ class _ConfigLoader:
 class _PulseService:
     def __init__(self, *, pi_amplitude: float = 0.25) -> None:
         self.pi_amplitude = pi_amplitude
+        self.pi_targets: list[str] = []
+        self.x180_targets: list[str] = []
 
-    def x180(self, _target: str) -> Rect:
+    def get_pi_pulse(self, target: str) -> Rect:
+        self.pi_targets.append(target)
         return Rect(
             duration=16.0,
             amplitude=self.pi_amplitude,
             sampling_period=2.0,
         )
+
+    def x180(self, target: str) -> Rect:
+        self.x180_targets.append(target)
+        return Rect(duration=16.0, amplitude=0.2, sampling_period=2.0)
 
     def calc_control_amplitude(self, _target: str, rabi_rate: float) -> float:
         return 10.0 * rabi_rate
@@ -173,6 +180,8 @@ def test_calibration_uses_default_repeated_gate_sweeps_and_finds_zx90() -> None:
     ):
         schedule = call["sequence"](0.5)
         assert schedule.duration == pytest.approx(288.0 * repetition, abs=1e-12)
+    assert exp.pulse.pi_targets == ["Q1"]
+    assert exp.pulse.x180_targets == ["Q0"]
 
 
 def test_pi_pair_schedule_places_signed_pi_pulses_in_each_half() -> None:
@@ -205,6 +214,46 @@ def test_pi_pair_schedule_places_signed_pi_pulses_in_each_half() -> None:
     assert_allclose(first_half.real, 0.25 * expected_signs, rtol=0.0, atol=1e-12)
     assert_allclose(first_half.imag, 0.0, rtol=0.0, atol=1e-12)
     assert_allclose(target[72:136], -first_half, rtol=0.0, atol=1e-12)
+    assert exp.pulse.pi_targets == ["Q1"]
+    assert exp.pulse.x180_targets == ["Q0"]
+
+
+def test_pi_pair_schedule_accepts_explicit_target_rotary_pi_pulse() -> None:
+    """An explicit rotary X180 should replace the default non-DRAG target pulse."""
+    exp = _Experiment(cancel_amplitude=0.0)
+    rotary_x180 = Rect(duration=16.0, amplitude=0.3, sampling_period=2.0)
+
+    schedule = pi_pair_rotary_zx90(
+        exp,  # type: ignore[arg-type]
+        "Q0",
+        "Q1",
+        cr_amplitude=0.5,
+        duration=128.0,
+        rotary_x180=rotary_x180,
+    )
+
+    target = schedule.get_sampled_sequence("Q1")
+    assert_allclose(target[8:16].real, 0.3, rtol=0.0, atol=1e-12)
+    assert exp.pulse.pi_targets == []
+
+
+def test_calibration_accepts_explicit_target_rotary_pi_pulse() -> None:
+    """Calibration should use one explicit rotary pulse for every schedule."""
+    exp = _Experiment(root=0.5)
+    rotary_x180 = Rect(duration=16.0, amplitude=0.3, sampling_period=2.0)
+
+    result = calibrate_pi_pair_rotary_zx90(
+        exp,  # type: ignore[arg-type]
+        "Q0",
+        "Q1",
+        duration=128.0,
+        rotary_x180=rotary_x180,
+        plot=False,
+    )
+
+    calibration = result.data["pi_pair_rotary_zx90_calibration"]
+    assert calibration["rotary_amplitude"] == pytest.approx(0.3, abs=1e-12)
+    assert exp.pulse.pi_targets == []
 
 
 def test_calibration_accepts_explicit_n7_repetition() -> None:
