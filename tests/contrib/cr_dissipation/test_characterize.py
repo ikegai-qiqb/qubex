@@ -34,7 +34,7 @@ def test_optional_diagnostics_default_on_and_fidelity_uncertainty_off() -> None:
     assert defaults["measure_reference"] is True
     assert defaults["measure_orthogonal_components"] is True
     assert defaults["compute_fidelity_uncertainty"] is False
-    assert defaults["profile_timing"] is False
+    assert defaults["profile_timing"] is True
 
 
 def test_summary_compacts_fit_quality_and_warning_output(
@@ -367,10 +367,22 @@ def test_primary_gef_acquisition_is_split_by_protocol_and_shot_policy(
         "actual_d": 5.0,
         "fidelity": 6.0,
     }
+    fit_diagnostics = {
+        "actual_c": {
+            "free_nonnegative_seconds": 1.0,
+            "null_seconds": 0.2,
+            "signed_diagnostic_seconds": 2.0,
+            "simulator_evaluations": 12,
+            "segment_expm_evaluations": 24,
+            "segment_cache_hits": 30,
+            "segment_cache_misses": 24,
+        }
+    }
 
     def analyze(*_args: Any, **kwargs: Any) -> object:
         stage_timings = kwargs["stage_timings"]
         stage_timings.update(analysis_timings)
+        kwargs["c_d_fit_diagnostics"].update(fit_diagnostics)
         return object()
 
     monkeypatch.setattr(health, "analyze_cr_dissipation", analyze)
@@ -386,6 +398,12 @@ def test_primary_gef_acquisition_is_split_by_protocol_and_shot_policy(
         health,
         "_print_stage_timings",
         lambda timings: printed_timings.append(dict(timings)),
+    )
+    printed_fit_diagnostics: list[dict[str, dict[str, float | int]]] = []
+    monkeypatch.setattr(
+        health,
+        "_print_cd_fit_diagnostics",
+        lambda diagnostics: printed_fit_diagnostics.append(dict(diagnostics)),
     )
 
     result = health.characterize_cr_dissipation(
@@ -457,6 +475,8 @@ def test_primary_gef_acquisition_is_split_by_protocol_and_shot_policy(
     }
     assert result.data["stage_timings_seconds"]["plotting"] >= 0.0
     assert printed_timings == [result.data["stage_timings_seconds"]]
+    assert result.data["c_d_fit_diagnostics"] == fit_diagnostics
+    assert printed_fit_diagnostics == [fit_diagnostics]
     assert result.data["analysis_options"]["c_d_fit_method"] == (
         "two_qutrit_physical_forward_variable_projection"
     )

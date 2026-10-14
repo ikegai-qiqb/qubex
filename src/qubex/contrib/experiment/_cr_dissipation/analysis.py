@@ -1201,8 +1201,9 @@ def fit_physical_dephasing(
     fixed_rates: CrNoiseRates,
     fitted_role: Literal["control", "target"],
     force_free: bool = False,
+    diagnostics: dict[str, float | int] | None = None,
 ) -> PhysicalForwardDephasingFit:
-    """Fit C/D total CR-active pure dephasing with affine SPAM terms."""
+    """Fit C/D pure dephasing and optionally record detailed work counters."""
     maximum_count = max(1, int(np.max(repetition_counts)))
     duration = (
         sum(
@@ -1215,11 +1216,48 @@ def fit_physical_dephasing(
     upper = max(1e-8, 50.0 / max(duration, 1.0))
     curve_cache: dict[tuple[float, bool], NDArray[np.float64]] = {}
     superoperator_cache: SuperoperatorCache = {}
+    simulation_diagnostics: dict[str, int] = {}
+
+    def finalize_diagnostics() -> None:
+        """Copy zero-inclusive simulation counters to the caller's record."""
+        if diagnostics is None:
+            return
+        diagnostics.update(
+            {
+                "simulator_requests": diagnostics.get("simulator_requests", 0),
+                "simulator_evaluations": diagnostics.get("simulator_evaluations", 0),
+                "simulator_curve_cache_hits": diagnostics.get(
+                    "simulator_curve_cache_hits", 0
+                ),
+                "segment_expm_evaluations": simulation_diagnostics.get(
+                    "segment_expm_evaluations", 0
+                ),
+                "segment_cache_hits": simulation_diagnostics.get(
+                    "segment_cache_hits", 0
+                ),
+                "segment_cache_misses": simulation_diagnostics.get(
+                    "segment_cache_misses", 0
+                ),
+            }
+        )
 
     def simulated(rate: float, signed: bool = False) -> NDArray[np.float64]:
+        if diagnostics is not None:
+            diagnostics["simulator_requests"] = (
+                int(diagnostics.get("simulator_requests", 0)) + 1
+            )
         uses_signed_override = signed and rate < 0.0
         key = (float(rate), uses_signed_override)
-        if key not in curve_cache:
+        if key in curve_cache:
+            if diagnostics is not None:
+                diagnostics["simulator_curve_cache_hits"] = (
+                    int(diagnostics.get("simulator_curve_cache_hits", 0)) + 1
+                )
+        else:
+            if diagnostics is not None:
+                diagnostics["simulator_evaluations"] = (
+                    int(diagnostics.get("simulator_evaluations", 0)) + 1
+                )
             kwargs: dict[str, float] = {}
             rates = fixed_rates
             if fitted_role == "control":
@@ -1243,6 +1281,7 @@ def fit_physical_dephasing(
                 cr_rates=rates,
                 include_leakage=True,
                 cache=superoperator_cache,
+                diagnostics=simulation_diagnostics,
                 **kwargs,
             )
         return curve_cache[key]
@@ -1275,11 +1314,16 @@ def fit_physical_dephasing(
             max_nfev=300,
         )
 
+    free_started = perf_counter()
     free = make_candidate("free_nonnegative", free_rate=True)
+    if diagnostics is not None:
+        diagnostics["free_nonnegative_seconds"] = perf_counter() - free_started
     if force_free:
         candidates = {free.name: free}
         if not free.success:
+            finalize_diagnostics()
             return _failed_physical_fit(candidates, values.size)
+        finalize_diagnostics()
         return PhysicalForwardDephasingFit(
             True,
             free.name,
@@ -1294,16 +1338,24 @@ def fit_physical_dephasing(
             None,
             "Free constrained estimator used for non-recursive idle baseline.",
         )
+    null_started = perf_counter()
     null = make_candidate("zero_total_dephasing", free_rate=False)
+    if diagnostics is not None:
+        diagnostics["null_seconds"] = perf_counter() - null_started
+    signed_started = perf_counter()
     diagnostic = make_candidate("signed_diagnostic", free_rate=True, signed=True)
+    if diagnostics is not None:
+        diagnostics["signed_diagnostic_seconds"] = perf_counter() - signed_started
     candidates = {null.name: null, free.name: free, diagnostic.name: diagnostic}
     if not null.success or not free.success:
+        finalize_diagnostics()
         return _failed_physical_fit(candidates, values.size)
     selected = select_aicc_candidate(
         {null.name: null, free.name: free},
         delta_threshold=MODEL_SELECTION_DELTA_AICC,
     )
     if selected is None:
+        finalize_diagnostics()
         return _failed_physical_fit(candidates, values.size)
     if selected.name == free.name:
         rate = float(free.parameters[0])
@@ -1340,6 +1392,8 @@ def fit_physical_dephasing(
         else f"`{PROTOCOL_A}`/`{PROTOCOL_B}` nominal dissipation was fixed while "
         "total CR-active pure dephasing was tested."
     )
+    fitted_values = amplitude * simulated(rate) + offset
+    finalize_diagnostics()
     return PhysicalForwardDephasingFit(
         True,
         selected.name,
@@ -1349,7 +1403,7 @@ def fit_physical_dephasing(
         amplitude,
         offset,
         candidates,
-        amplitude * simulated(rate) + offset,
+        fitted_values,
         unconstrained_rate,
         unconstrained_error,
         message,
@@ -1814,6 +1868,7 @@ def _extract_idle_equivalent_baseline(
     *,
     covariance_rcond: float,
     stage_timings: dict[str, float] | None = None,
+    c_d_fit_diagnostics: dict[str, dict[str, float | int]] | None = None,
 ) -> _IdleEquivalentBaseline:
     """Simulate idle-only data and fit it through the primary estimators once."""
     ab_started = perf_counter()
@@ -1966,6 +2021,9 @@ def _extract_idle_equivalent_baseline(
         raise ValueError(
             f"`{PROTOCOL_C}`/`{PROTOCOL_D}` primary standard errors are required."
         )
+    c_baseline_diagnostics: dict[str, float | int] | None = (
+        {} if c_d_fit_diagnostics is not None else None
+    )
     c_baseline_fit = fit_physical_dephasing(
         c_raw,
         c_data.primary_standard_error,
@@ -1978,6 +2036,12 @@ def _extract_idle_equivalent_baseline(
         fixed_rates=baseline_rates,
         fitted_role="control",
         force_free=True,
+        diagnostics=c_baseline_diagnostics,
+    )
+    if c_d_fit_diagnostics is not None and c_baseline_diagnostics is not None:
+        c_d_fit_diagnostics["idle_c"] = c_baseline_diagnostics
+    d_baseline_diagnostics: dict[str, float | int] | None = (
+        {} if c_d_fit_diagnostics is not None else None
     )
     d_baseline_fit = fit_physical_dephasing(
         d_raw,
@@ -1991,7 +2055,10 @@ def _extract_idle_equivalent_baseline(
         fixed_rates=baseline_rates,
         fitted_role="target",
         force_free=True,
+        diagnostics=d_baseline_diagnostics,
     )
+    if c_d_fit_diagnostics is not None and d_baseline_diagnostics is not None:
+        c_d_fit_diagnostics["idle_d"] = d_baseline_diagnostics
     c_phi = c_baseline_fit.rate_per_ns if c_baseline_fit.success else float("nan")
     d_phi = d_baseline_fit.rate_per_ns if d_baseline_fit.success else float("nan")
     equivalent["control_transverse"] = (
@@ -2256,6 +2323,7 @@ def analyze_cr_dissipation(
     covariance_rcond: float,
     compute_fidelity_uncertainty: bool = False,
     stage_timings: dict[str, float] | None = None,
+    c_d_fit_diagnostics: dict[str, dict[str, float | int]] | None = None,
 ) -> CrDissipationAnalysis:
     """Run the complete conditional analysis, optionally recording stage times."""
     warnings: list[CrDissipationWarning] = []
@@ -2267,6 +2335,7 @@ def analyze_cr_dissipation(
         target_idle,
         covariance_rcond=covariance_rcond,
         stage_timings=stage_timings,
+        c_d_fit_diagnostics=c_d_fit_diagnostics,
     )
     ab_started = perf_counter()
     control_fit = fit_control_populations(
@@ -2390,6 +2459,9 @@ def analyze_cr_dissipation(
             target_seepage=nominal["target_seepage"],
         )
         c_started = perf_counter()
+        c_diagnostics: dict[str, float | int] | None = (
+            {} if c_d_fit_diagnostics is not None else None
+        )
         c_fit = fit_physical_dephasing(
             c_data.primary_expectation,
             c_data.primary_standard_error,
@@ -2401,10 +2473,16 @@ def analyze_cr_dissipation(
             target_idle=target_idle,
             fixed_rates=fixed,
             fitted_role="control",
+            diagnostics=c_diagnostics,
         )
+        if c_d_fit_diagnostics is not None and c_diagnostics is not None:
+            c_d_fit_diagnostics["actual_c"] = c_diagnostics
         if stage_timings is not None:
             stage_timings["actual_c"] = perf_counter() - c_started
         d_started = perf_counter()
+        d_diagnostics: dict[str, float | int] | None = (
+            {} if c_d_fit_diagnostics is not None else None
+        )
         d_fit = fit_physical_dephasing(
             d_data.primary_expectation,
             d_data.primary_standard_error,
@@ -2416,7 +2494,10 @@ def analyze_cr_dissipation(
             target_idle=target_idle,
             fixed_rates=fixed,
             fitted_role="target",
+            diagnostics=d_diagnostics,
         )
+        if c_d_fit_diagnostics is not None and d_diagnostics is not None:
+            c_d_fit_diagnostics["actual_d"] = d_diagnostics
         if stage_timings is not None:
             stage_timings["actual_d"] = perf_counter() - d_started
     nominal["control_pure_dephasing"] = (

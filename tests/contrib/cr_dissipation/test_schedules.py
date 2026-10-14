@@ -58,6 +58,7 @@ def test_segment_superoperator_cache_reuses_matrix_exponential(
     )
     idle = IdleNoiseParameters(float("inf"), float("inf"))
     cache: simulation_module.SuperoperatorCache = {}
+    diagnostics: dict[str, int] = {}
     original_expm = simulation_module.expm
     calls = 0
 
@@ -75,9 +76,15 @@ def test_segment_superoperator_cache_reuses_matrix_exponential(
             cr_rates=CrNoiseRates(),
             include_leakage=True,
             cache=cache,
+            diagnostics=diagnostics,
         )
 
     assert calls == 1
+    assert diagnostics == {
+        "segment_cache_hits": 3,
+        "segment_cache_misses": 1,
+        "segment_expm_evaluations": 1,
+    }
 
 
 def test_repeated_observable_matches_independent_channel_powers(

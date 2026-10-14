@@ -375,6 +375,7 @@ def segment_superoperator(
     signed_control_pure_dephasing: float | None = None,
     signed_target_pure_dephasing: float | None = None,
     cache: SuperoperatorCache | None = None,
+    diagnostics: dict[str, int] | None = None,
 ) -> NDArray[np.complex128]:
     """Return one piecewise semantic evolution superoperator."""
     key = _segment_cache_key(
@@ -387,7 +388,15 @@ def segment_superoperator(
         signed_target_pure_dephasing=signed_target_pure_dephasing,
     )
     if cache is not None and key in cache:
+        if diagnostics is not None:
+            diagnostics["segment_cache_hits"] = (
+                diagnostics.get("segment_cache_hits", 0) + 1
+            )
         return cache[key]
+    if diagnostics is not None:
+        diagnostics["segment_cache_misses"] = (
+            diagnostics.get("segment_cache_misses", 0) + 1
+        )
     liouvillian = hamiltonian_liouvillian(segment.hamiltonian)
     dissipative = (
         _cr_dissipative_liouvillian(
@@ -403,6 +412,10 @@ def segment_superoperator(
         expm((liouvillian + dissipative) * segment.duration_ns),
         dtype=_COMPLEX,
     )
+    if diagnostics is not None:
+        diagnostics["segment_expm_evaluations"] = (
+            diagnostics.get("segment_expm_evaluations", 0) + 1
+        )
     if cache is not None:
         if len(cache) >= _MAX_SEGMENT_CACHE_ENTRIES:
             cache.pop(next(iter(cache)))
@@ -420,6 +433,7 @@ def compose_channel(
     signed_control_pure_dephasing: float | None = None,
     signed_target_pure_dephasing: float | None = None,
     cache: SuperoperatorCache | None = None,
+    diagnostics: dict[str, int] | None = None,
 ) -> NDArray[np.complex128]:
     """Compose a chronological semantic channel."""
     channel = np.eye(_SUPER_DIMENSION, dtype=_COMPLEX)
@@ -436,6 +450,7 @@ def compose_channel(
                 signed_control_pure_dephasing=signed_control_pure_dephasing,
                 signed_target_pure_dephasing=signed_target_pure_dephasing,
                 cache=cache,
+                diagnostics=diagnostics,
             )
         channel = step @ channel
     return channel
@@ -465,6 +480,7 @@ def simulate_repeated_observable(
     signed_control_pure_dephasing: float | None = None,
     signed_target_pure_dephasing: float | None = None,
     cache: SuperoperatorCache | None = None,
+    diagnostics: dict[str, int] | None = None,
 ) -> NDArray[np.float64]:
     """Simulate expectations using shared binary powers of one protocol block."""
     block_channel = compose_channel(
@@ -476,6 +492,7 @@ def simulate_repeated_observable(
         signed_control_pure_dephasing=signed_control_pure_dephasing,
         signed_target_pure_dephasing=signed_target_pure_dephasing,
         cache=cache,
+        diagnostics=diagnostics,
     )
     counts = np.asarray(repetition_counts, dtype=np.int64).reshape(-1)
     if np.any(counts < 0):

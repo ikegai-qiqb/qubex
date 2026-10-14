@@ -1278,6 +1278,7 @@ def test_negative_signed_diagnostic_projects_to_the_zero_candidate(
         lambda *_args, **_kwargs: np.ones(counts.size),
     )
 
+    diagnostics: dict[str, float | int] = {}
     fit = fit_physical_dephasing(
         np.ones(counts.size),
         np.full(counts.size, 2e-5),
@@ -1289,6 +1290,7 @@ def test_negative_signed_diagnostic_projects_to_the_zero_candidate(
         target_idle=idle,
         fixed_rates=CrNoiseRates(),
         fitted_role="control",
+        diagnostics=diagnostics,
     )
 
     assert fit.status == CrDissipationRateStatus.INCONSISTENT_RATE_DECOMPOSITION
@@ -1297,3 +1299,9 @@ def test_negative_signed_diagnostic_projects_to_the_zero_candidate(
     assert fit.spam_amplitude == pytest.approx(0.8)
     assert fit.spam_offset == pytest.approx(0.1)
     assert fit.fitted_values == pytest.approx(np.full(counts.size, 0.9))
+    assert diagnostics["free_nonnegative_seconds"] >= 0.0
+    assert diagnostics["null_seconds"] >= 0.0
+    assert diagnostics["signed_diagnostic_seconds"] >= 0.0
+    assert diagnostics["simulator_requests"] == 1
+    assert diagnostics["simulator_evaluations"] == 1
+    assert diagnostics["segment_expm_evaluations"] == 0

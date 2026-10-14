@@ -1605,6 +1605,64 @@ def _print_stage_timings(stage_timings: Mapping[str, float]) -> None:
         print(f"  {label:<20} {value}")
 
 
+def _print_cd_fit_diagnostics(
+    diagnostics: Mapping[str, Mapping[str, float | int]],
+) -> None:
+    """Print detailed work performed by each idle and actual C/D fit."""
+    print("\nC/D fit diagnostics")
+    headings = (
+        "Fit",
+        "free [s]",
+        "null [s]",
+        "signed [s]",
+        "sim eval/request",
+        "expm",
+        "cache hit/miss",
+    )
+    rows: list[tuple[str, ...]] = []
+    for key, label in (
+        ("idle_c", "idle C"),
+        ("idle_d", "idle D"),
+        ("actual_c", "actual C"),
+        ("actual_d", "actual D"),
+    ):
+        values = diagnostics.get(key, {})
+
+        def seconds(source: Mapping[str, float | int], name: str) -> str:
+            value = source.get(name)
+            return "—" if value is None else f"{float(value):.3f}"
+
+        rows.append(
+            (
+                label,
+                seconds(values, "free_nonnegative_seconds"),
+                seconds(values, "null_seconds"),
+                seconds(values, "signed_diagnostic_seconds"),
+                f"{int(values.get('simulator_evaluations', 0))}/"
+                f"{int(values.get('simulator_requests', 0))}",
+                str(int(values.get("segment_expm_evaluations", 0))),
+                f"{int(values.get('segment_cache_hits', 0))}/"
+                f"{int(values.get('segment_cache_misses', 0))}",
+            )
+        )
+    widths = [
+        max(len(headings[index]), *(len(row[index]) for row in rows))
+        for index in range(len(headings))
+    ]
+    print(
+        "  ".join(
+            value.ljust(width) for value, width in zip(headings, widths, strict=True)
+        )
+    )
+    print("  ".join("-" * width for width in widths))
+    for row in rows:
+        print(
+            "  ".join(
+                value.ljust(width) for value, width in zip(row, widths, strict=True)
+            )
+        )
+
+
 # Public experiment orchestration
 
 
@@ -1631,7 +1689,7 @@ def characterize_cr_dissipation(
     reference_ix45_amplitude: float | None = None,
     force_reference_ix45_calibration: bool = False,
     compute_fidelity_uncertainty: bool = False,
-    profile_timing: bool = False,
+    profile_timing: bool = True,
     enable_tqdm: bool = True,
     plot: bool = True,
 ) -> Result:
@@ -1729,7 +1787,9 @@ def characterize_cr_dissipation(
     profile_timing : bool, optional
         Whether to record and print wall-clock durations for idle-baseline,
         primary-fit, fidelity, and figure-construction stages. Figure display in
-        the notebook or browser is excluded. Defaults to `False`.
+        the notebook or browser is excluded. Detailed C/D optimizer and
+        simulator counters are also recorded. Defaults to `True` on this
+        diagnostic branch.
     enable_tqdm : bool, optional
         Whether acquisition services display progress bars.
     plot : bool, optional
@@ -2028,6 +2088,9 @@ def characterize_cr_dissipation(
         orthogonal=orthogonal,
     )
     stage_timings: dict[str, float] | None = {} if profile_timing else None
+    c_d_fit_diagnostics: dict[str, dict[str, float | int]] | None = (
+        {} if profile_timing else None
+    )
     analysis = analyze_cr_dissipation(
         measurements,
         descriptor,
@@ -2037,6 +2100,7 @@ def characterize_cr_dissipation(
         covariance_rcond=covariance_rcond,
         compute_fidelity_uncertainty=compute_fidelity_uncertainty,
         stage_timings=stage_timings,
+        c_d_fit_diagnostics=c_d_fit_diagnostics,
     )
     if plot:
         plotting_started = perf_counter()
@@ -2049,6 +2113,8 @@ def characterize_cr_dissipation(
         _print_summary(analysis, control_idle, target_idle)
     if stage_timings is not None:
         _print_stage_timings(stage_timings)
+    if c_d_fit_diagnostics is not None:
+        _print_cd_fit_diagnostics(c_d_fit_diagnostics)
     if plot:
         for figure in figures.values():
             figure.show()
@@ -2224,6 +2290,13 @@ def characterize_cr_dissipation(
             "pulse_timing": pulse_timing,
             "stage_timings_seconds": (
                 None if stage_timings is None else dict(stage_timings)
+            ),
+            "c_d_fit_diagnostics": (
+                None
+                if c_d_fit_diagnostics is None
+                else {
+                    name: dict(values) for name, values in c_d_fit_diagnostics.items()
+                }
             ),
         },
         figure=figures.get(PROTOCOL_A),
