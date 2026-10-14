@@ -16,6 +16,7 @@ from datetime import datetime
 from itertools import pairwise
 from math import ceil, floor
 from numbers import Integral, Real
+from time import perf_counter
 from typing import Any, TypedDict, cast
 
 import numpy as np
@@ -1586,6 +1587,24 @@ def _format_fidelity_summary_value(
     return value + (" *" if conditional else ""), conditional
 
 
+def _print_stage_timings(stage_timings: Mapping[str, float]) -> None:
+    """Print opt-in analysis and figure-construction wall-clock timings."""
+    labels = (
+        ("idle_baseline_ab", "idle baseline A/B"),
+        ("idle_baseline_cd", "idle baseline C/D"),
+        ("actual_ab", "actual A/B"),
+        ("actual_c", "actual C"),
+        ("actual_d", "actual D"),
+        ("fidelity", "fidelity"),
+        ("plotting", "plotting"),
+    )
+    print("\nStage timings [s]")
+    for key, label in labels:
+        elapsed = stage_timings.get(key)
+        value = "not run" if elapsed is None else f"{elapsed:.3f}"
+        print(f"  {label:<20} {value}")
+
+
 # Public experiment orchestration
 
 
@@ -1612,6 +1631,7 @@ def characterize_cr_dissipation(
     reference_ix45_amplitude: float | None = None,
     force_reference_ix45_calibration: bool = False,
     compute_fidelity_uncertainty: bool = False,
+    profile_timing: bool = False,
     enable_tqdm: bool = True,
     plot: bool = True,
 ) -> Result:
@@ -1706,6 +1726,10 @@ def characterize_cr_dissipation(
         limits with sigma points. Disable to retain central fidelities while
         skipping the most expensive post-fit uncertainty calculation. Defaults
         to `False`.
+    profile_timing : bool, optional
+        Whether to record and print wall-clock durations for idle-baseline,
+        primary-fit, fidelity, and figure-construction stages. Figure display in
+        the notebook or browser is excluded. Defaults to `False`.
     enable_tqdm : bool, optional
         Whether acquisition services display progress bars.
     plot : bool, optional
@@ -1737,6 +1761,7 @@ def characterize_cr_dissipation(
         ("measure_orthogonal_components", measure_orthogonal_components),
         ("force_reference_ix45_calibration", force_reference_ix45_calibration),
         ("compute_fidelity_uncertainty", compute_fidelity_uncertainty),
+        ("profile_timing", profile_timing),
         ("enable_tqdm", enable_tqdm),
         ("plot", plot),
     ):
@@ -2002,6 +2027,7 @@ def characterize_cr_dissipation(
         reference_names=reference_names,
         orthogonal=orthogonal,
     )
+    stage_timings: dict[str, float] | None = {} if profile_timing else None
     analysis = analyze_cr_dissipation(
         measurements,
         descriptor,
@@ -2010,10 +2036,20 @@ def characterize_cr_dissipation(
         target_idle,
         covariance_rcond=covariance_rcond,
         compute_fidelity_uncertainty=compute_fidelity_uncertainty,
+        stage_timings=stage_timings,
     )
-    figures = _plot_cr_dissipation(measurements, analysis) if plot else {}
+    if plot:
+        plotting_started = perf_counter()
+        figures = _plot_cr_dissipation(measurements, analysis)
+        if stage_timings is not None:
+            stage_timings["plotting"] = perf_counter() - plotting_started
+    else:
+        figures = {}
     if plot:
         _print_summary(analysis, control_idle, target_idle)
+    if stage_timings is not None:
+        _print_stage_timings(stage_timings)
+    if plot:
         for figure in figures.values():
             figure.show()
 
@@ -2107,6 +2143,7 @@ def characterize_cr_dissipation(
         "reference_ix45_amplitude": reference_ix45_amplitude,
         "force_reference_ix45_calibration": force_reference_ix45_calibration,
         "compute_fidelity_uncertainty": compute_fidelity_uncertainty,
+        "profile_timing": profile_timing,
         "enable_tqdm": enable_tqdm,
     }
     analysis_options = {
@@ -2185,6 +2222,9 @@ def characterize_cr_dissipation(
             "measurement_options": measurement_options,
             "analysis_options": analysis_options,
             "pulse_timing": pulse_timing,
+            "stage_timings_seconds": (
+                None if stage_timings is None else dict(stage_timings)
+            ),
         },
         figure=figures.get(PROTOCOL_A),
         figures=figures,

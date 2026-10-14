@@ -34,6 +34,7 @@ def test_optional_diagnostics_default_on_and_fidelity_uncertainty_off() -> None:
     assert defaults["measure_reference"] is True
     assert defaults["measure_orthogonal_components"] is True
     assert defaults["compute_fidelity_uncertainty"] is False
+    assert defaults["profile_timing"] is False
 
 
 def test_summary_compacts_fit_quality_and_warning_output(
@@ -358,9 +359,21 @@ def test_primary_gef_acquisition_is_split_by_protocol_and_shot_policy(
     monkeypatch.setattr(
         health, "_build_measurements", lambda *_args, **_kwargs: object()
     )
-    monkeypatch.setattr(
-        health, "analyze_cr_dissipation", lambda *_args, **_kwargs: object()
-    )
+    analysis_timings = {
+        "idle_baseline_ab": 1.0,
+        "idle_baseline_cd": 2.0,
+        "actual_ab": 3.0,
+        "actual_c": 4.0,
+        "actual_d": 5.0,
+        "fidelity": 6.0,
+    }
+
+    def analyze(*_args: Any, **kwargs: Any) -> object:
+        stage_timings = kwargs["stage_timings"]
+        stage_timings.update(analysis_timings)
+        return object()
+
+    monkeypatch.setattr(health, "analyze_cr_dissipation", analyze)
     shown: list[str] = []
     figures = {
         protocol: SimpleNamespace(show=lambda name=protocol: shown.append(name))
@@ -368,6 +381,12 @@ def test_primary_gef_acquisition_is_split_by_protocol_and_shot_policy(
     }
     monkeypatch.setattr(health, "_plot_cr_dissipation", lambda *_args: figures)
     monkeypatch.setattr(health, "_print_summary", lambda *_args: None)
+    printed_timings: list[dict[str, float]] = []
+    monkeypatch.setattr(
+        health,
+        "_print_stage_timings",
+        lambda timings: printed_timings.append(dict(timings)),
+    )
 
     result = health.characterize_cr_dissipation(
         _fake_experiment(),
@@ -382,6 +401,7 @@ def test_primary_gef_acquisition_is_split_by_protocol_and_shot_policy(
         idle_t2_echo={"Q0": 1.0, "Q1": 1.0},
         measure_reference=False,
         measure_orthogonal_components=False,
+        profile_timing=True,
         plot=True,
     )
 
@@ -429,6 +449,14 @@ def test_primary_gef_acquisition_is_split_by_protocol_and_shot_policy(
     assert result.data["measurement_options"]["orthogonal_observables"] == {}
     assert result.data["measurement_options"]["orthogonal_readout"] is None
     assert result.data["measurement_options"]["reference_readout"] is None
+    assert result.data["measurement_options"]["profile_timing"] is True
+    assert result.data["stage_timings_seconds"] is not None
+    assert result.data["stage_timings_seconds"].keys() == {
+        *analysis_timings,
+        "plotting",
+    }
+    assert result.data["stage_timings_seconds"]["plotting"] >= 0.0
+    assert printed_timings == [result.data["stage_timings_seconds"]]
     assert result.data["analysis_options"]["c_d_fit_method"] == (
         "two_qutrit_physical_forward_variable_projection"
     )

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from time import perf_counter
 from typing import Any, Literal
 
 import numpy as np
@@ -1812,8 +1813,10 @@ def _extract_idle_equivalent_baseline(
     target_idle: IdleNoiseParameters,
     *,
     covariance_rcond: float,
+    stage_timings: dict[str, float] | None = None,
 ) -> _IdleEquivalentBaseline:
     """Simulate idle-only data and fit it through the primary estimators once."""
+    ab_started = perf_counter()
     counts = measurements.repetition_counts
     idle_control_rates: dict[str, float] = dict.fromkeys(_CONTROL_RATE_ORDER, 0.0)
     idle_control_rates["control_e_to_g"] = control_idle.relaxation_rate_per_ns
@@ -1882,6 +1885,10 @@ def _extract_idle_equivalent_baseline(
     equivalent["target_seepage"] = float(
         np.mean([value[1] for value in target_exchange_by_protocol.values()])
     )
+    if stage_timings is not None:
+        stage_timings["idle_baseline_ab"] = perf_counter() - ab_started
+
+    cd_started = perf_counter()
     baseline_rates = CrNoiseRates(
         control_e_to_g=equivalent["control_e_to_g"],
         control_g_to_e=equivalent["control_g_to_e"],
@@ -2002,12 +2009,15 @@ def _extract_idle_equivalent_baseline(
             },
             dict(equivalent),
         )
-    return _IdleEquivalentBaseline(
+    baseline = _IdleEquivalentBaseline(
         predictions,
         equivalent,
         {PROTOCOL_C: c_raw, PROTOCOL_D: d_raw},
         raw_reference_predictions,
     )
+    if stage_timings is not None:
+        stage_timings["idle_baseline_cd"] = perf_counter() - cd_started
+    return baseline
 
 
 def _apply_idle_prediction_spam(
@@ -2245,8 +2255,9 @@ def analyze_cr_dissipation(
     *,
     covariance_rcond: float,
     compute_fidelity_uncertainty: bool = False,
+    stage_timings: dict[str, float] | None = None,
 ) -> CrDissipationAnalysis:
-    """Run the complete conditional analysis on processed measurements."""
+    """Run the complete conditional analysis, optionally recording stage times."""
     warnings: list[CrDissipationWarning] = []
     idle_baseline = _extract_idle_equivalent_baseline(
         measurements,
@@ -2255,7 +2266,9 @@ def analyze_cr_dissipation(
         control_idle,
         target_idle,
         covariance_rcond=covariance_rcond,
+        stage_timings=stage_timings,
     )
+    ab_started = perf_counter()
     control_fit = fit_control_populations(
         measurements,
         descriptor,
@@ -2278,6 +2291,8 @@ def analyze_cr_dissipation(
         target_idle,
         leak_b,
     )
+    if stage_timings is not None:
+        stage_timings["actual_ab"] = perf_counter() - ab_started
     warnings.extend(
         _target_control_state_dependence_warnings(t1_a, t1_b, leak_a, leak_b)
     )
@@ -2356,8 +2371,14 @@ def analyze_cr_dissipation(
             f"Skipped because at least one required `{PROTOCOL_A}`/`{PROTOCOL_B}` "
             "primitive rate failed."
         )
+        c_started = perf_counter()
         c_fit = _dependency_failed_physical_fit(message, counts.size)
+        if stage_timings is not None:
+            stage_timings["actual_c"] = perf_counter() - c_started
+        d_started = perf_counter()
         d_fit = _dependency_failed_physical_fit(message, counts.size)
+        if stage_timings is not None:
+            stage_timings["actual_d"] = perf_counter() - d_started
     else:
         fixed = CrNoiseRates(
             control_e_to_g=nominal["control_e_to_g"],
@@ -2368,6 +2389,7 @@ def analyze_cr_dissipation(
             target_leakage=nominal["target_leakage"],
             target_seepage=nominal["target_seepage"],
         )
+        c_started = perf_counter()
         c_fit = fit_physical_dephasing(
             c_data.primary_expectation,
             c_data.primary_standard_error,
@@ -2380,6 +2402,9 @@ def analyze_cr_dissipation(
             fixed_rates=fixed,
             fitted_role="control",
         )
+        if stage_timings is not None:
+            stage_timings["actual_c"] = perf_counter() - c_started
+        d_started = perf_counter()
         d_fit = fit_physical_dephasing(
             d_data.primary_expectation,
             d_data.primary_standard_error,
@@ -2392,6 +2417,8 @@ def analyze_cr_dissipation(
             fixed_rates=fixed,
             fitted_role="target",
         )
+        if stage_timings is not None:
+            stage_timings["actual_d"] = perf_counter() - d_started
     nominal["control_pure_dephasing"] = (
         c_fit.rate_per_ns if c_fit.success else float("nan")
     )
@@ -2606,6 +2633,7 @@ def analyze_cr_dissipation(
         (8, d_fit.rate_standard_error_per_ns),
     ):
         primitive_covariance[index, index] = 0.0 if error is None else error**2
+    fidelity_started = perf_counter()
     fidelity, fidelity_warnings = _fidelity_limits(
         descriptor,
         control_idle,
@@ -2617,6 +2645,8 @@ def analyze_cr_dissipation(
         compute_uncertainty=compute_fidelity_uncertainty,
         statistically_mismatched_rates=tuple(sorted(statistically_mismatched_rates)),
     )
+    if stage_timings is not None:
+        stage_timings["fidelity"] = perf_counter() - fidelity_started
     warnings.extend(fidelity_warnings)
     fits = CrDissipationFits(control_fit, t1_a, leak_a, t1_b, leak_b, c_fit, d_fit)
     return CrDissipationAnalysis(
