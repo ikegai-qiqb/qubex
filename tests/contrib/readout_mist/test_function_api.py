@@ -165,7 +165,7 @@ def test_workflow_uses_override_for_actual_and_complete_blank_for_reference(
 
     result = characterize_readout_mist(
         _experiment(),
-        "Q0",
+        target="Q0",
         repetition_counts=(0, 1, 2, 4, 8),
         readout_cycle=cycle,
         plot=False,
@@ -174,7 +174,9 @@ def test_workflow_uses_override_for_actual_and_complete_blank_for_reference(
 
     assert len(calls) == 2
     assert calls[0]["calibration_n_shots"] == 8192
+    assert calls[0]["capture_index"] == -1
     assert calls[1]["calibration"] is calibration
+    assert calls[1]["capture_index"] == -1
     actual_n1 = calls[0]["sequences"]["actual/initial_g/n=1"]
     reference_n1 = calls[1]["sequences"]["reference/initial_g/n=1"]
     assert np.any(actual_n1.values["RQ0"] != 0.0)
@@ -182,3 +184,4 @@ def test_workflow_uses_override_for_actual_and_complete_blank_for_reference(
     assert actual_n1.duration == reference_n1.duration
     assert result.data["analysis"].actual.state_order == ("g", "e", "f")
     assert result.data["readout_cycle_timing"]["trailing_gap_in_final_cycle"] is True
+    assert result.data["measurement_options"]["diagnostic_capture_index"] == -1

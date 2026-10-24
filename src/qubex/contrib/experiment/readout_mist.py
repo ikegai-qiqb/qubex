@@ -42,6 +42,11 @@ TRANSITION_MATRIX_INDICES = (
     ("f_to_e", 1, 2),
 )
 TRANSITION_ORDER = tuple(name for name, _, _ in TRANSITION_MATRIX_INDICES)
+_PHYSICAL_PARAMETER_ORDER = (
+    *TRANSITION_ORDER,
+    *(f"{protocol}_{state}" for protocol in PROTOCOL_ORDER for state in STATE_ORDER),
+)
+_DIAGNOSTIC_CAPTURE_INDEX = -1
 
 
 class ReadoutMistProbabilityStatus(str, Enum):
@@ -170,6 +175,14 @@ class ReadoutMistMeasurements:
             raise ValueError(
                 "repetition_counts must be increasing, nonnegative, and contain 0 and 1."
             )
+        reference_presence = tuple(
+            self.protocols[protocol].reference is not None
+            for protocol in PROTOCOL_ORDER
+        )
+        if any(reference_presence) and not all(reference_presence):
+            raise ValueError(
+                "Reference data must be present for all protocols or none."
+            )
         for protocol in PROTOCOL_ORDER:
             measured = self.protocols[protocol]
             if measured.actual.population.shape[0] != counts.size:
@@ -290,14 +303,14 @@ def _finite_nonnegative(value: float, name: str) -> float:
 
 def build_default_readout_cycle(
     exp: Experiment,
-    qubit: str,
+    target: str,
     *,
     cycle_gap_ns: float,
 ) -> PulseSchedule:
     """Build the configured readout drive followed by the complete trailing gap."""
     gap = _finite_nonnegative(cycle_gap_ns, "cycle_gap_ns")
-    readout_label = exp.ctx.resolve_read_label(qubit)
-    readout = exp.pulse.readout(qubit)
+    readout_label = exp.ctx.resolve_read_label(target)
+    readout = exp.pulse.readout(target)
     with PulseSchedule([readout_label]) as cycle:
         cycle.add(readout_label, readout)
         if gap > 0.0:
@@ -324,10 +337,10 @@ def build_reference_cycle(candidate: PulseSchedule) -> PulseSchedule:
     return candidate.scaled(0.0)
 
 
-def _preparations(exp: Experiment, qubit: str) -> dict[str, PulseSchedule]:
+def _preparations(exp: Experiment, target: str) -> dict[str, PulseSchedule]:
     """Build G, E, and F preparations using calibrated GE/EF pi pulses."""
-    ge_label = exp.ctx.resolve_ge_label(qubit)
-    ef_label = exp.ctx.resolve_ef_label(qubit)
+    ge_label = exp.ctx.resolve_ge_label(target)
+    ef_label = exp.ctx.resolve_ef_label(target)
     preparations: dict[str, PulseSchedule] = {}
     with PulseSchedule([ge_label, ef_label]) as ground:
         pass
@@ -374,7 +387,7 @@ def _logical_order(
 
 def build_mist_schedules(
     exp: Experiment,
-    qubit: str,
+    target: str,
     cycle: PulseSchedule,
     repetition_counts: Sequence[int],
     *,
@@ -383,7 +396,7 @@ def build_mist_schedules(
     acquisition_seed: int | None = 0,
 ) -> ReadoutMistSchedules:
     """Build G/E/F schedules while preserving the trailing gap in every cycle."""
-    preparations = _preparations(exp, qubit)
+    preparations = _preparations(exp, target)
     by_condition: dict[str, tuple[PulseSchedule, ...]] = {}
     names_by_condition: dict[str, tuple[str, ...]] = {}
     lookup: dict[tuple[str, int], tuple[str, PulseSchedule]] = {}
@@ -933,8 +946,11 @@ def _failed_fit(message: str) -> ReadoutMistMatrixFit:
         derived_metrics={},
         initial_populations={},
         fitted_populations={},
-        parameter_order=(),
-        parameter_covariance=np.full((15, 15), np.nan),
+        parameter_order=_PHYSICAL_PARAMETER_ORDER,
+        parameter_covariance=np.full(
+            (len(_PHYSICAL_PARAMETER_ORDER), len(_PHYSICAL_PARAMETER_ORDER)),
+            np.nan,
+        ),
         goodness_of_fit=goodness,
         whitened_residual=np.empty(0),
         message=message,
@@ -1028,14 +1044,6 @@ def _fit_condition(
     }
     initial_populations = initial_populations_from_parameters(fitted.parameters)
     predicted = _predictions(fitted.parameters, measurements.repetition_counts)
-    physical_order = (
-        *TRANSITION_ORDER,
-        *(
-            f"{protocol}_{state}"
-            for protocol in PROTOCOL_ORDER
-            for state in STATE_ORDER
-        ),
-    )
     return ReadoutMistMatrixFit(
         success=True,
         transition_matrix=transition_matrix_from_parameters(fitted.parameters),
@@ -1043,7 +1051,7 @@ def _fit_condition(
         derived_metrics=derived,
         initial_populations=initial_populations,
         fitted_populations=predicted,
-        parameter_order=physical_order,
+        parameter_order=_PHYSICAL_PARAMETER_ORDER,
         parameter_covariance=covariance,
         goodness_of_fit=fitted.goodness_of_fit,
         whitened_residual=fitted.whitened_residual,
@@ -1134,9 +1142,7 @@ def analyze_readout_mist(
         reference=False,
         covariance_rcond=covariance_rcond,
     )
-    has_reference = all(
-        measurements.protocols[name].reference is not None for name in PROTOCOL_ORDER
-    )
+    has_reference = measurements.protocols[PROTOCOL_ORDER[0]].reference is not None
     reference = (
         _fit_condition(
             measurements,
@@ -1278,13 +1284,13 @@ def _finite_positive(value: float, name: str) -> float:
 def _extract_series(
     result: Result,
     schedules: ReadoutMistSchedules,
-    qubit: str,
+    target: str,
     protocol: str,
 ) -> GefPopulationSeries:
     """Convert named GEF fits into one ordered population trajectory."""
     data = cast(Mapping[str, Any], result.data)
     fits = cast(Mapping[str, Mapping[str, Any]], data["fits"])
-    selected = [fits[name][qubit] for name in schedules.names_by_condition[protocol]]
+    selected = [fits[name][target] for name in schedules.names_by_condition[protocol]]
     return GefPopulationSeries(
         population=np.stack([fit.population for fit in selected]),
         covariance=np.stack([fit.population_covariance for fit in selected]),
@@ -1307,7 +1313,7 @@ def _extract_series(
 
 def _build_measurements(
     counts: tuple[int, ...],
-    qubit: str,
+    target: str,
     actual_result: Result,
     actual_schedules: ReadoutMistSchedules,
     reference_result: Result | None,
@@ -1316,14 +1322,14 @@ def _build_measurements(
     """Build fixed-order measurement records from GEF result mappings."""
     protocols = {
         protocol: ReadoutMistConditionMeasurements(
-            actual=_extract_series(actual_result, actual_schedules, qubit, protocol),
+            actual=_extract_series(actual_result, actual_schedules, target, protocol),
             reference=(
                 None
                 if reference_result is None or reference_schedules is None
                 else _extract_series(
                     reference_result,
                     reference_schedules,
-                    qubit,
+                    target,
                     protocol,
                 )
             ),
@@ -1493,7 +1499,7 @@ def _print_summary(analysis: ReadoutMistAnalysis) -> None:
 
 def characterize_readout_mist(
     exp: Experiment,
-    qubit: str,
+    target: str,
     *,
     repetition_counts: Sequence[int] | None = None,
     readout_cycle: PulseSchedule | None = None,
@@ -1515,8 +1521,8 @@ def characterize_readout_mist(
     ----------
     exp : Experiment
         Experiment used for calibrated pulse construction and acquisition.
-    qubit : str
-        Qubit whose GEF transition matrix is measured.
+    target : str
+        Target qubit whose GEF transition matrix is measured.
     repetition_counts : Sequence[int] | None, optional
         Strictly increasing counts beginning with zero and containing one.
         At least five points are required. Defaults to `(0, 1, 2, 4, 8, 16, 32)`.
@@ -1561,9 +1567,12 @@ def characterize_readout_mist(
     The blank reference zeros the entire candidate cycle while preserving its
     timing; its fitted difference is diagnostic and is not subtracted as an
     estimate of readout-only transitions. The final GEF discriminator uses the
-    calibrated configured readout, independently of `readout_cycle`. Consequently,
-    diagnostic-readout backaction and population outside the closed GEF subspace
-    remain model limitations and are surfaced through retained raw data and warnings.
+    calibrated configured readout, independently of `readout_cycle`. If the
+    candidate cycle also creates captures, only the last capture—the final GEF
+    diagnostic readout—is used for population estimation and retained as raw IQ.
+    Consequently, diagnostic-readout backaction and population outside the closed
+    GEF subspace remain model limitations and are surfaced through retained raw
+    data and warnings.
     """
     for name, value in (
         ("measure_reference", measure_reference),
@@ -1595,19 +1604,19 @@ def characterize_readout_mist(
         configured_interval if shot_interval is None else shot_interval,
         "shot_interval",
     )
-    target = exp.ctx.resolve_qubit_label(qubit)
+    resolved_target = exp.ctx.resolve_qubit_label(target)
     if readout_cycle is not None and cycle_gap_ns != 0.0:
         raise ValueError(
             "cycle_gap_ns must be zero when readout_cycle supplies the complete cycle."
         )
     cycle = (
-        build_default_readout_cycle(exp, target, cycle_gap_ns=cycle_gap_ns)
+        build_default_readout_cycle(exp, resolved_target, cycle_gap_ns=cycle_gap_ns)
         if readout_cycle is None
         else validate_readout_cycle(readout_cycle)
     )
     actual_schedules = build_mist_schedules(
         exp,
-        target,
+        resolved_target,
         cycle,
         counts,
         prefix="actual",
@@ -1616,7 +1625,7 @@ def characterize_readout_mist(
     )
     actual_result = measure_gef_populations(
         exp,
-        targets=[target],
+        targets=[resolved_target],
         sequences=actual_schedules.submitted,
         n_shots=measurement_shots,
         calibration_n_shots=calibration_shots,
@@ -1625,6 +1634,7 @@ def characterize_readout_mist(
         n_bootstrap=0,
         enable_tqdm=enable_tqdm,
         progress_label="readout MIST actual",
+        capture_index=_DIAGNOSTIC_CAPTURE_INDEX,
     )
     actual_data = cast(Mapping[str, Any], actual_result.data)
     calibration = actual_data["calibration"]
@@ -1635,7 +1645,7 @@ def characterize_readout_mist(
         reference_cycle = build_reference_cycle(cycle)
         reference_schedules = build_mist_schedules(
             exp,
-            target,
+            resolved_target,
             reference_cycle,
             counts,
             prefix="reference",
@@ -1644,7 +1654,7 @@ def characterize_readout_mist(
         )
         reference_result = measure_gef_populations(
             exp,
-            targets=[target],
+            targets=[resolved_target],
             sequences=reference_schedules.submitted,
             calibration=calibration,
             n_shots=measurement_shots,
@@ -1653,10 +1663,11 @@ def characterize_readout_mist(
             n_bootstrap=0,
             enable_tqdm=enable_tqdm,
             progress_label="readout MIST blank reference",
+            capture_index=_DIAGNOSTIC_CAPTURE_INDEX,
         )
     measurements = _build_measurements(
         counts,
-        target,
+        resolved_target,
         actual_result,
         actual_schedules,
         reference_result,
@@ -1687,6 +1698,7 @@ def characterize_readout_mist(
         "shot_interval_ns": interval,
         "measure_reference": measure_reference,
         "gef_covariance_rcond": covariance_rcond,
+        "diagnostic_capture_index": _DIAGNOSTIC_CAPTURE_INDEX,
         "acquisition_order": acquisition_order,
         "acquisition_seed": seed,
         "enable_tqdm": enable_tqdm,

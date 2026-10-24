@@ -97,9 +97,11 @@ class _DummyMeasurementService:
         self.iq_queue = list(iq_queue)
         self.calls: list[dict[str, object]] = []
         self.batch_calls: list[int] = []
+        self.extra_capture_batches: set[int] = set()
 
     async def run_sweep_measurement(self, schedule, *, sweep_values, **kwargs):
         """Record one acquisition and return ordered single-shot captures."""
+        batch_index = len(self.batch_calls)
         self.batch_calls.append(len(sweep_values))
         results = []
         for value in sweep_values:
@@ -107,7 +109,12 @@ class _DummyMeasurementService:
             results.append(
                 SimpleNamespace(
                     data={
-                        target: [
+                        target: (
+                            [SimpleNamespace(data=np.zeros(kwargs["n_shots"]))]
+                            if batch_index in self.extra_capture_batches
+                            else []
+                        )
+                        + [
                             SimpleNamespace(
                                 data=np.resize(data.kerneled, kwargs["n_shots"])
                             )
@@ -320,6 +327,45 @@ def test_measure_gef_populations_reuses_supplied_calibration() -> None:
     )
 
 
+def test_measure_gef_populations_can_use_the_last_capture() -> None:
+    """Only the selected diagnostic capture should enter population estimation."""
+    samples = _state_samples()
+    calibration_exp = _DummyExperiment(
+        [_pure(samples, state) for state in ("g", "g", "e", "f", "e", "f")]
+    )
+    calibration = calibrate_gef_population(
+        calibration_exp,  # type: ignore[arg-type]
+        targets="Q0",
+        n_shots=100,
+    )
+    measurement_exp = _DummyExperiment(
+        [
+            _mixture(samples, (6, 1, 3)),
+            _mixture(samples, (1, 3, 6)),
+            _mixture(samples, (3, 6, 1)),
+        ]
+    )
+    measurement_exp.measurement_service.extra_capture_batches.add(0)
+
+    result = measure_gef_populations(
+        measurement_exp,  # type: ignore[arg-type]
+        targets="Q0",
+        sequences=[PulseSchedule(["Q0"])],
+        calibration=calibration,
+        n_shots=100,
+        n_bootstrap=0,
+        capture_index=-1,
+    )
+
+    assert_allclose(
+        result.data["populations"]["sequence_0"]["Q0"],
+        [0.6, 0.1, 0.3],
+        rtol=1e-6,
+        atol=1e-7,
+    )
+    assert result.data["measurement_options"]["capture_index"] == -1
+
+
 def test_measure_gef_populations_estimates_multiple_targets_in_the_same_shots() -> None:
     """Control and target marginal populations should share nine measurement calls."""
     q0_samples = _state_samples()
@@ -416,6 +462,7 @@ def test_measure_gef_populations_rejects_empty_sequences() -> None:
         ({"n_shots": True}, "n_shots"),
         ({"calibration_n_shots": 2.5}, "calibration_n_shots"),
         ({"shot_interval": True}, "shot_interval"),
+        ({"capture_index": True}, "capture_index"),
     ],
 )
 def test_measure_gef_populations_rejects_invalid_acquisition_options_first(

@@ -703,6 +703,7 @@ def measure_gef_populations(
     bootstrap_confidence_level: float = _DEFAULT_BOOTSTRAP_CONFIDENCE_LEVEL,
     enable_tqdm: bool = False,
     progress_label: str | None = None,
+    capture_index: int | None = None,
 ) -> Result:
     """
     Calibrate and estimate GEF populations after arbitrary pulse schedules.
@@ -714,8 +715,9 @@ def measure_gef_populations(
     targets
         Qubit label or labels whose marginal GEF populations are estimated.
     sequences
-        Named mapping or ordered sequence of state-preparation schedules. Ordered
-        inputs receive names such as `sequence_0`.
+        Named mapping or ordered sequence of schedules executed before the final
+        diagnostic readout. Schedules may contain earlier readout pulses and
+        captures. Ordered inputs receive names such as `sequence_0`.
     calibration
         Optional prior calibration keyed by canonical qubit label. When omitted,
         six calibration configurations are measured before the input sequences.
@@ -746,6 +748,11 @@ def measure_gef_populations(
         Optional label printed before each acquisition progress bar. It is useful
         for a composed experiment that submits several GEF batches. When given,
         it must contain at least one non-whitespace character.
+    capture_index
+        Capture selected independently for each target and population-measurement
+        point. Negative indexing is supported. By default, exactly one capture
+        is required. Any calibration acquired by this call retains the
+        single-capture contract.
 
     Returns
     -------
@@ -763,11 +770,18 @@ def measure_gef_populations(
     readout starts at a common time within each group.
     Populations are modeled only in the g/e/f subspace and sum to one. The method
     assumes negligible initial f population during calibration, ideal GE/EF
-    population swaps, and stable readout response throughout the run.
+    population swaps, and stable readout response throughout the run. Only the
+    selected capture is retained in `raw_iq` and used for moment summaries and
+    population fitting; other captures are discarded.
     """
     target_list = _normalize_targets(exp, targets)
     named_sequences = _normalize_sequences(sequences)
     resolved_progress_label = _validate_progress_label(progress_label)
+    if capture_index is not None and (
+        isinstance(capture_index, bool) or not isinstance(capture_index, Integral)
+    ):
+        raise TypeError("capture_index must be an integer or None.")
+    resolved_capture_index = None if capture_index is None else int(capture_index)
     resolved_n_shots = _resolve_shot_count(
         n_shots,
         name="n_shots",
@@ -838,6 +852,7 @@ def measure_gef_populations(
         n_shots=resolved_n_shots,
         shot_interval=resolved_shot_interval,
         enable_tqdm=enable_tqdm,
+        capture_index=resolved_capture_index,
     )
     raw_iq = {
         sequence_name: {
@@ -901,6 +916,7 @@ def measure_gef_populations(
                 "bootstrap_confidence_level": resolved_bootstrap_confidence_level,
                 "enable_tqdm": enable_tqdm,
                 "progress_label": resolved_progress_label,
+                "capture_index": resolved_capture_index,
             },
         }
     )
@@ -1359,6 +1375,7 @@ def _measure_configurations(
     n_shots: int,
     shot_interval: float,
     enable_tqdm: bool,
+    capture_index: int | None = None,
 ) -> tuple[
     dict[_ConfigurationKey, dict[str, NDArray[np.complex128]]],
     dict[_ConfigurationKey, dict[str, IQMomentSummary]],
@@ -1372,6 +1389,7 @@ def _measure_configurations(
         n_shots=n_shots,
         shot_interval=shot_interval,
         enable_tqdm=enable_tqdm,
+        capture_index=capture_index,
     )
     for key, result in zip(schedules, results, strict=True):
         raw_iq[key] = {}

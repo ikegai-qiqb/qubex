@@ -1,6 +1,7 @@
 """Acquire ordered single-shot schedules for contrib experiments."""
 
 from collections.abc import Sequence
+from numbers import Integral
 
 import numpy as np
 from numpy.typing import NDArray
@@ -17,6 +18,7 @@ def measure_single_shot_batch(
     n_shots: int,
     shot_interval: float,
     enable_tqdm: bool = False,
+    capture_index: int | None = None,
 ) -> list[dict[str, NDArray[np.complex128]]]:
     """
     Acquire a single-shot sweep and validate its ordered IQ payloads.
@@ -26,15 +28,20 @@ def measure_single_shot_batch(
     exp
         Experiment providing readout timing and the async measurement service.
     schedules
-        Ordered preparation/analyzer schedules without readout. Each callback
-        returns a copy so readout construction cannot mutate the inputs.
-        An empty sequence returns an empty list without accessing hardware.
+        Ordered schedules before the automatically appended final readout. They
+        may already contain readout pulses and captures. Each callback returns a
+        copy so final-readout construction cannot mutate the inputs. An empty
+        sequence returns an empty list without accessing hardware.
     n_shots
         Validated shot count, at least two for the contrib estimators.
     shot_interval
         Validated positive interval in ns.
     enable_tqdm
         Whether the underlying sweep displays its progress bar.
+    capture_index
+        Capture selected independently for each target and sweep point. Negative
+        indexing is supported. By default, require exactly one capture and
+        select it.
 
     Returns
     -------
@@ -45,8 +52,11 @@ def measure_single_shot_batch(
     Raises
     ------
     ValueError
-        If point counts, capture counts, or finite single-shot shapes differ
-        from the acquisition contract. Callers validate required target labels.
+        If point counts, the requested capture, or finite single-shot shapes
+        differ from the acquisition contract. Callers validate required target
+        labels.
+    TypeError
+        If `capture_index` is not an integer or `None`.
 
     Notes
     -----
@@ -55,6 +65,11 @@ def measure_single_shot_batch(
     calls from notebooks; its wait budget includes estimated acquisition time
     and an overhead allowance, not a strict hardware duration limit.
     """
+    if capture_index is not None and (
+        isinstance(capture_index, bool) or not isinstance(capture_index, Integral)
+    ):
+        raise TypeError("capture_index must be an integer or None.")
+    resolved_capture_index = None if capture_index is None else int(capture_index)
     if not schedules:
         return []
     schedules = tuple(schedules)
@@ -94,11 +109,24 @@ def measure_single_shot_batch(
     for index, point in enumerate(result.results):
         shots_by_target: dict[str, NDArray[np.complex128]] = {}
         for target, captures in point.data.items():
-            if len(captures) != 1:
-                raise ValueError(
-                    f"Batch point {index}, {target}: expected one capture."
-                )
-            iq = np.asarray(captures[0].data, dtype=np.complex128)
+            capture_count = len(captures)
+            if resolved_capture_index is None:
+                if capture_count != 1:
+                    raise ValueError(
+                        f"Batch point {index}, {target}: expected one capture."
+                    )
+                capture = captures[0]
+            else:
+                try:
+                    capture = captures[resolved_capture_index]
+                except IndexError as error:
+                    raise ValueError(
+                        f"Batch point {index}, {target}: capture_index "
+                        f"{resolved_capture_index} is out of range for "
+                        f"{capture_count} "
+                        f"{'capture' if capture_count == 1 else 'captures'}."
+                    ) from error
+            iq = np.asarray(capture.data, dtype=np.complex128)
             if iq.shape != (n_shots,) or not np.all(np.isfinite(iq)):
                 raise ValueError(
                     f"Batch point {index}, {target}: expected {n_shots} finite IQ shots."

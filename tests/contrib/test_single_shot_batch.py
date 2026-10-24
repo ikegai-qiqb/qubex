@@ -68,6 +68,19 @@ def test_batch_preserves_shots_and_copies_input(in_event_loop, monkeypatch):
         ([], "number of points"),
         ([SimpleNamespace(data={"Q0": []})], "one capture"),
         (
+            [
+                SimpleNamespace(
+                    data={
+                        "Q0": [
+                            SimpleNamespace(data=np.ones(2)),
+                            SimpleNamespace(data=np.ones(2)),
+                        ]
+                    }
+                )
+            ],
+            "one capture",
+        ),
+        (
             [SimpleNamespace(data={"Q0": [SimpleNamespace(data=np.array([1]))]})],
             "finite IQ shots",
         ),
@@ -103,4 +116,66 @@ def test_batch_rejects_incomplete_or_invalid_shots(payload, message):
             [PulseSchedule(["Q0"])],
             n_shots=2,
             shot_interval=100,
+        )
+
+
+def test_batch_can_select_the_last_capture() -> None:
+    """An opted-in caller should receive only the requested capture."""
+    candidate_iq = np.array([10 + 20j, 30 + 40j])
+    diagnostic_iq = np.array([1 + 2j, 3 + 4j])
+
+    async def sweep(*args, **kwargs):
+        return SimpleNamespace(
+            results=[
+                SimpleNamespace(
+                    data={
+                        "Q0": [
+                            SimpleNamespace(data=candidate_iq),
+                            SimpleNamespace(data=diagnostic_iq),
+                        ]
+                    }
+                )
+            ]
+        )
+
+    exp = SimpleNamespace(
+        pulse=SimpleNamespace(
+            readout_duration=0, readout_pre_margin=0, readout_post_margin=0
+        ),
+        measurement_service=SimpleNamespace(run_sweep_measurement=sweep),
+    )
+
+    result = measure_single_shot_batch(
+        cast(Any, exp),
+        [PulseSchedule(["Q0"])],
+        n_shots=2,
+        shot_interval=100,
+        capture_index=-1,
+    )
+
+    np.testing.assert_array_equal(result[0]["Q0"], diagnostic_iq)
+
+
+def test_batch_rejects_an_out_of_range_capture_index() -> None:
+    """A requested capture must exist at every returned point and target."""
+
+    async def sweep(*args, **kwargs):
+        return SimpleNamespace(
+            results=[SimpleNamespace(data={"Q0": [SimpleNamespace(data=np.ones(2))]})]
+        )
+
+    exp = SimpleNamespace(
+        pulse=SimpleNamespace(
+            readout_duration=0, readout_pre_margin=0, readout_post_margin=0
+        ),
+        measurement_service=SimpleNamespace(run_sweep_measurement=sweep),
+    )
+
+    with pytest.raises(ValueError, match=r"capture_index 1.*1 capture"):
+        measure_single_shot_batch(
+            cast(Any, exp),
+            [PulseSchedule(["Q0"])],
+            n_shots=2,
+            shot_interval=100,
+            capture_index=1,
         )

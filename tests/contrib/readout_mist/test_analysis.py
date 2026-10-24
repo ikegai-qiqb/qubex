@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+import qubex.contrib.experiment.readout_mist as mist_module
 from qubex.contrib.experiment.readout_mist import (
     TRANSITION_ORDER,
     GefPopulationFitDiagnostic,
@@ -125,6 +126,20 @@ def test_population_series_rejects_inconsistent_shapes() -> None:
         )
 
 
+def test_measurements_reject_partial_reference_data() -> None:
+    """Reference trajectories should be present for every protocol or none."""
+    measurements, _ = _synthetic_measurements()
+    protocols = dict(measurements.protocols)
+    initial_g = protocols["initial_g"]
+    protocols["initial_g"] = ReadoutMistConditionMeasurements(
+        actual=initial_g.actual,
+        reference=initial_g.actual,
+    )
+
+    with pytest.raises(ValueError, match="all protocols or none"):
+        ReadoutMistMeasurements(measurements.repetition_counts, protocols)
+
+
 def test_gef_diagnostic_allows_infinite_condition_number() -> None:
     """A singular GEF design should remain representable for warning generation."""
     diagnostic = GefPopulationFitDiagnostic(
@@ -136,6 +151,23 @@ def test_gef_diagnostic_allows_infinite_condition_number() -> None:
     )
 
     assert np.isinf(diagnostic.design_condition_number)
+
+
+def test_failed_fit_keeps_the_parameter_covariance_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed fit should retain labels for every covariance row and column."""
+    measurements, _ = _synthetic_measurements()
+    monkeypatch.setattr(mist_module, "_run_fit", lambda *args, **kwargs: None)
+
+    fit = analyze_readout_mist(measurements).actual
+
+    assert not fit.success
+    assert fit.parameter_covariance.shape == (
+        len(fit.parameter_order),
+        len(fit.parameter_order),
+    )
+    assert fit.parameter_order[: len(TRANSITION_ORDER)] == TRANSITION_ORDER
 
 
 @pytest.mark.parametrize("value", [True, -1.0, 1.0, float("nan")])
