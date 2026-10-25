@@ -3,13 +3,14 @@ Characterize measurement-induced state transitions from a readout cycle.
 
 The module constructs repeated candidate and blank-reference schedules, estimates
 GEF populations, fits a shared column-stochastic transition matrix, and reports
-conditional local uncertainty and model diagnostics.
+rank-aware conditional uncertainty, optional profile-likelihood upper bounds,
+and predefined reduced-model diagnostics.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from itertools import pairwise
 from numbers import Integral, Real
@@ -50,10 +51,12 @@ _DIAGNOSTIC_CAPTURE_INDEX = -1
 
 
 class ReadoutMistProbabilityStatus(str, Enum):
-    """Represent whether one transition probability is locally resolved."""
+    """Represent how one transition probability is constrained by the data."""
 
     RESOLVED = "resolved"
     CONSISTENT_WITH_ZERO = "consistent_with_zero"
+    UPPER_BOUND_ONLY = "upper_bound_only"
+    NOMINAL_ZERO_UNRESOLVED = "nominal_zero_unresolved"
     PARTIALLY_UNRESOLVED = "partially_unresolved"
     FIT_FAILED = "fit_failed"
 
@@ -203,11 +206,21 @@ class ReadoutMistMeasurements:
 
 @dataclass(frozen=True)
 class ProbabilityEstimate:
-    """Store one probability with conditional local uncertainty."""
+    """
+    Store one probability with local uncertainty and an optional profile bound.
+
+    A missing `standard_error` means that the quantity depends on a local
+    Jacobian null direction. Profile bounds are one-sided and conditional on the
+    fixed GEF calibration.
+    """
 
     value: float
     standard_error: float | None
     status: ReadoutMistProbabilityStatus
+    upper_bound: float | None = None
+    upper_bound_confidence_level: float | None = None
+    uncertainty_method: str = "local_gls"
+    unavailable_reason: str | None = None
     unit: str = "1/readout_cycle"
 
 
@@ -226,7 +239,13 @@ class FitGoodnessOfFit:
 
 @dataclass(frozen=True)
 class ReadoutMistMatrixFit:
-    """Store the full six-transition stochastic-matrix fit."""
+    """
+    Store one full or reduced stochastic transition-matrix fit.
+
+    `parameter_covariance` follows `parameter_order`. Rows and columns are NaN
+    when that physical quantity is not locally estimable; `parameter_estimable`
+    records the same decision explicitly.
+    """
 
     success: bool
     transition_matrix: NDArray[np.float64]
@@ -239,6 +258,15 @@ class ReadoutMistMatrixFit:
     goodness_of_fit: FitGoodnessOfFit
     whitened_residual: NDArray[np.float64]
     message: str
+    model_name: str = "full"
+    free_parameter_count: int = 12
+    objective: float = float("nan")
+    jacobian_rank: int = 0
+    jacobian_nullity: int = 0
+    jacobian_singular_values: NDArray[np.float64] = field(
+        default_factory=lambda: np.empty(0, dtype=np.float64)
+    )
+    parameter_estimable: dict[str, bool] = field(default_factory=dict)
     state_order: tuple[str, str, str] = STATE_ORDER
     probability_unit: str = "1/readout_cycle"
 
@@ -258,6 +286,24 @@ class ReadoutMistWarning:
 
 
 @dataclass(frozen=True)
+class ReadoutMistModelCandidate:
+    """Store one candidate model fit and its AICc comparison values."""
+
+    fit: ReadoutMistMatrixFit
+    aicc: float
+    delta_aicc: float
+
+
+@dataclass(frozen=True)
+class ReadoutMistModelComparison:
+    """Store candidate fits and the simplest accepted model within the AICc band."""
+
+    candidates: dict[str, ReadoutMistModelCandidate]
+    selected_model: str | None
+    delta_aicc_threshold: float
+
+
+@dataclass(frozen=True)
 class ReadoutMistAnalysis:
     """
     Store actual/reference fits, diagnostic differences, and warnings.
@@ -271,6 +317,8 @@ class ReadoutMistAnalysis:
     reference: ReadoutMistMatrixFit | None
     reference_difference: dict[str, float] | None
     warnings: tuple[ReadoutMistWarning, ...]
+    actual_model_comparison: ReadoutMistModelComparison | None = None
+    reference_model_comparison: ReadoutMistModelComparison | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -431,6 +479,54 @@ def build_mist_schedules(
     )
 
 
+def _interleave_acquisition_schedules(
+    actual: ReadoutMistSchedules,
+    reference: ReadoutMistSchedules | None,
+) -> dict[str, PulseSchedule]:
+    """Return one acquisition mapping with adjacent actual/reference pairs."""
+    if reference is None:
+        return dict(actual.submitted)
+    if len(actual.submitted) != len(reference.submitted):
+        raise ValueError("Actual and reference schedule counts must match.")
+
+    submitted: dict[str, PulseSchedule] = {}
+    for (actual_name, actual_schedule), (
+        reference_name,
+        reference_schedule,
+    ) in zip(actual.submitted.items(), reference.submitted.items(), strict=True):
+        if actual_name.removeprefix("actual/") != reference_name.removeprefix(
+            "reference/"
+        ):
+            raise ValueError("Actual and reference acquisition orders must match.")
+        submitted[actual_name] = actual_schedule
+        submitted[reference_name] = reference_schedule
+    return submitted
+
+
+def _align_reference_acquisition_order(
+    actual: ReadoutMistSchedules,
+    reference: ReadoutMistSchedules,
+) -> ReadoutMistSchedules:
+    """Align reference points to the one logical order sampled for actual points."""
+    reference_by_point = {
+        name.removeprefix("reference/"): schedule
+        for name, schedule in reference.submitted.items()
+    }
+    actual_points = tuple(name.removeprefix("actual/") for name in actual.submitted)
+    if len(reference_by_point) != len(actual_points) or set(reference_by_point) != set(
+        actual_points
+    ):
+        raise ValueError("Actual and reference schedule points must match.")
+    submitted = {
+        f"reference/{point}": reference_by_point[point] for point in actual_points
+    }
+    return replace(
+        reference,
+        submitted=submitted,
+        acquisition_order=tuple(submitted),
+    )
+
+
 # Numerical fitting helpers
 
 GOODNESS_OF_FIT_REDUCED_CHI_SQUARED_LIMIT = 5.0
@@ -451,9 +547,9 @@ class FullFitResult:
     """
     Store one nonlinear GLS result.
 
-    `success` records optimizer convergence. A converged central estimate can
-    therefore have a NaN covariance when its Jacobian is not locally
-    identifiable.
+    `success` records optimizer convergence. For a rank-deficient Jacobian,
+    `covariance` is the pseudo-covariance on the identifiable subspace and
+    `null_space` records the unresolved parameter directions.
     """
 
     success: bool
@@ -462,6 +558,11 @@ class FullFitResult:
     whitened_residual: NDArray[np.float64]
     goodness_of_fit: FitGoodnessOfFit
     message: str
+    objective: float
+    jacobian_rank: int
+    jacobian_nullity: int
+    jacobian_singular_values: NDArray[np.float64]
+    null_space: NDArray[np.float64]
 
 
 def covariance_whitener(
@@ -576,33 +677,88 @@ def _local_covariance(
     *,
     reduced_chi_squared: float,
 ) -> NDArray[np.float64]:
-    """Return scaled local covariance or NaNs for an unresolved Jacobian."""
-    if jacobian.ndim != 2 or not np.all(np.isfinite(jacobian)):
+    """Return covariance on the numerically identifiable parameter subspace."""
+    covariance, _, _, _, _ = _jacobian_diagnostics(
+        jacobian,
+        reduced_chi_squared=reduced_chi_squared,
+    )
+    return covariance
+
+
+def _jacobian_diagnostics(
+    jacobian: NDArray[np.float64],
+    *,
+    reduced_chi_squared: float,
+) -> tuple[
+    NDArray[np.float64],
+    NDArray[np.float64],
+    int,
+    NDArray[np.float64],
+    float,
+]:
+    """Return pseudo-covariance, singular spectrum, rank, null space, and cutoff."""
+    if jacobian.ndim != 2:
         size = jacobian.shape[-1] if jacobian.ndim > 0 else 0
-        return np.full((size, size), np.nan)
+        return (
+            np.full((size, size), np.nan),
+            np.empty(0, dtype=np.float64),
+            0,
+            np.eye(size, dtype=np.float64),
+            float("nan"),
+        )
     parameter_count = jacobian.shape[1]
     if parameter_count == 0:
-        return np.empty((0, 0), dtype=np.float64)
+        return (
+            np.empty((0, 0), dtype=np.float64),
+            np.empty(0, dtype=np.float64),
+            0,
+            np.empty((0, 0), dtype=np.float64),
+            0.0,
+        )
+    if not np.all(np.isfinite(jacobian)):
+        return (
+            np.full((parameter_count, parameter_count), np.nan),
+            np.full(min(jacobian.shape), np.nan),
+            0,
+            np.eye(parameter_count, dtype=np.float64),
+            float("nan"),
+        )
     try:
-        _, singular_values, vt = np.linalg.svd(jacobian, full_matrices=False)
+        _, singular_values, vt = np.linalg.svd(jacobian, full_matrices=True)
     except np.linalg.LinAlgError:
-        return np.full((parameter_count, parameter_count), np.nan)
+        return (
+            np.full((parameter_count, parameter_count), np.nan),
+            np.full(min(jacobian.shape), np.nan),
+            0,
+            np.eye(parameter_count, dtype=np.float64),
+            float("nan"),
+        )
     largest = float(np.max(singular_values)) if singular_values.size else 0.0
     tolerance = max(
         1e-12 * largest,
         _EPS * max(jacobian.shape) * largest,
     )
-    if (
-        singular_values.size < parameter_count
-        or not np.all(np.isfinite(singular_values))
-        or largest <= 0.0
-        or np.count_nonzero(singular_values > tolerance) < parameter_count
-    ):
-        return np.full((parameter_count, parameter_count), np.nan)
-    covariance = (vt.T / np.square(singular_values)) @ vt
-    return np.asarray(
+    rank = (
+        int(np.count_nonzero(singular_values > tolerance))
+        if np.all(np.isfinite(singular_values)) and largest > 0.0
+        else 0
+    )
+    resolved_vt = vt[:rank]
+    covariance = (
+        (resolved_vt.T / np.square(singular_values[:rank])) @ resolved_vt
+        if rank > 0
+        else np.zeros((parameter_count, parameter_count), dtype=np.float64)
+    )
+    covariance = np.asarray(
         0.5 * (covariance + covariance.T) * max(1.0, reduced_chi_squared),
         dtype=np.float64,
+    )
+    return (
+        covariance,
+        np.asarray(singular_values, dtype=np.float64),
+        rank,
+        np.asarray(vt[rank:], dtype=np.float64),
+        tolerance,
     )
 
 
@@ -636,9 +792,10 @@ def fit_full_gls(
     """
     Fit robust initializations followed by final ordinary GLS.
 
-    The central estimate remains successful when optimization converges but
-    local covariance is unavailable. Callers must inspect covariance finiteness
-    separately when reporting uncertainty.
+    A converged central estimate remains successful for a rank-deficient
+    Jacobian. In that case, `covariance` contains the pseudo-covariance on the
+    identifiable subspace; callers must use `null_space` when deciding whether
+    a derived physical quantity has a meaningful local uncertainty.
     """
     if isinstance(parameter_count, bool) or not isinstance(parameter_count, Integral):
         raise TypeError("parameter_count must be a positive integer.")
@@ -678,15 +835,22 @@ def fit_full_gls(
             whitened_residual=np.empty(0),
             goodness_of_fit=goodness,
             message="All nonlinear GLS initializations failed.",
+            objective=float("nan"),
+            jacobian_rank=0,
+            jacobian_nullity=parameter_count,
+            jacobian_singular_values=np.empty(0, dtype=np.float64),
+            null_space=np.eye(parameter_count, dtype=np.float64),
         )
     _, final, whitened = min(solutions, key=lambda item: item[0])
     jacobian = np.asarray(final.jac, dtype=np.float64)
     dof = max(1, whitened.size - parameter_count)
-    covariance = _local_covariance(
+    covariance, singular_values, rank, null_space, _ = _jacobian_diagnostics(
         jacobian,
         reduced_chi_squared=float(whitened @ whitened) / dof,
     )
-    covariance_available = bool(np.all(np.isfinite(covariance)))
+    covariance_available = bool(
+        np.all(np.isfinite(covariance)) and rank == parameter_count
+    )
     return FullFitResult(
         success=True,
         parameters=np.asarray(final.x, dtype=np.float64),
@@ -700,10 +864,16 @@ def fit_full_gls(
             str(final.message)
             if covariance_available
             else (
-                f"{final.message} Central parameters converged, but the parameters "
-                "are not locally identifiable; local covariance is unavailable."
+                f"{final.message} Central parameters converged, but some parameters "
+                "are not locally identifiable; the reported covariance is "
+                "restricted to the identifiable parameter subspace."
             )
         ),
+        objective=float(whitened @ whitened),
+        jacobian_rank=rank,
+        jacobian_nullity=parameter_count - rank,
+        jacobian_singular_values=singular_values,
+        null_space=null_space,
     )
 
 
@@ -713,6 +883,140 @@ _PARAMETER_COUNT = 12
 _INITIAL_ANCHORS = {"initial_g": 0, "initial_e": 1, "initial_f": 2}
 _GEF_OBJECTIVE_WARNING_THRESHOLD = 100.0
 _GEF_CONDITION_NUMBER_WARNING_THRESHOLD = 1e10
+_MODEL_SELECTION_DELTA_AICC = 6.0
+_ESTIMABILITY_RELATIVE_TOLERANCE = 1e-7
+
+
+@dataclass(frozen=True)
+class _TransitionModelSpec:
+    """Define fixed off-diagonal transition probabilities for one fit model."""
+
+    name: str
+    fixed_probabilities: tuple[tuple[str, float], ...] = ()
+
+
+_FULL_MODEL = _TransitionModelSpec("full")
+_ADJACENT_ONLY_MODEL = _TransitionModelSpec(
+    "adjacent_only",
+    (("g_to_f", 0.0), ("f_to_g", 0.0)),
+)
+_NO_LEAKAGE_MODEL = _TransitionModelSpec(
+    "no_leakage",
+    (("g_to_f", 0.0), ("e_to_f", 0.0)),
+)
+_REDUCED_MODEL_SPECS = (_ADJACENT_ONLY_MODEL, _NO_LEAKAGE_MODEL)
+
+
+def _transition_name(final_state: int, initial_state: int) -> str:
+    """Return the public name for one off-diagonal transition."""
+    return next(
+        name
+        for name, final, initial in TRANSITION_MATRIX_INDICES
+        if final == final_state and initial == initial_state
+    )
+
+
+def _model_transition_parameter_count(spec: _TransitionModelSpec) -> int:
+    """Return the number of free off-diagonal transition parameters."""
+    return len(TRANSITION_ORDER) - len(spec.fixed_probabilities)
+
+
+def _decode_model_parameters(
+    parameters: NDArray[np.float64],
+    spec: _TransitionModelSpec,
+) -> tuple[NDArray[np.float64], dict[str, NDArray[np.float64]]]:
+    """Decode one model parameter vector into a transition matrix and initials."""
+    fixed = dict(spec.fixed_probabilities)
+    if len(fixed) != len(spec.fixed_probabilities) or any(
+        name not in TRANSITION_ORDER for name in fixed
+    ):
+        raise ValueError(f"Model `{spec.name}` contains invalid fixed transitions.")
+    if any(
+        not np.isfinite(value) or not 0.0 <= value < 1.0 for value in fixed.values()
+    ):
+        raise ValueError(
+            f"Model `{spec.name}` fixed probabilities must be finite and in [0, 1)."
+        )
+    transition_parameter_count = _model_transition_parameter_count(spec)
+    expected = transition_parameter_count + 2 * len(PROTOCOL_ORDER)
+    if parameters.shape != (expected,):
+        raise ValueError(f"Model `{spec.name}` requires {expected} parameters.")
+    matrix = np.zeros((3, 3), dtype=np.float64)
+    offset = 0
+    for initial_state in range(3):
+        destinations = tuple(index for index in range(3) if index != initial_state)
+        fixed_in_column = {
+            destination: fixed[_transition_name(destination, initial_state)]
+            for destination in destinations
+            if _transition_name(destination, initial_state) in fixed
+        }
+        fixed_sum = float(sum(fixed_in_column.values()))
+        if fixed_sum >= 1.0:
+            raise ValueError(
+                f"Model `{spec.name}` fixes at least one column to probability >= 1."
+            )
+        remaining = 1.0 - fixed_sum
+        free_destinations = tuple(
+            destination
+            for destination in destinations
+            if destination not in fixed_in_column
+        )
+        logits = parameters[offset : offset + len(free_destinations)]
+        offset += len(free_destinations)
+        weights = np.exp(logits)
+        denominator = 1.0 + float(np.sum(weights))
+        matrix[initial_state, initial_state] = remaining / denominator
+        for destination, probability in fixed_in_column.items():
+            matrix[destination, initial_state] = probability
+        for destination, weight in zip(free_destinations, weights, strict=True):
+            matrix[destination, initial_state] = remaining * float(weight) / denominator
+    initial = {
+        protocol: _simplex_from_logits(
+            parameters[offset + 2 * index : offset + 2 * index + 2],
+            anchor=_INITIAL_ANCHORS[protocol],
+        )
+        for index, protocol in enumerate(PROTOCOL_ORDER)
+    }
+    return matrix, initial
+
+
+def _encode_model_parameters(
+    transition: NDArray[np.float64],
+    initial: Mapping[str, NDArray[np.float64]],
+    spec: _TransitionModelSpec,
+) -> NDArray[np.float64]:
+    """Encode physical starting values for a full, reduced, or profile model."""
+    fixed = dict(spec.fixed_probabilities)
+    values: list[float] = []
+    for initial_state in range(3):
+        destinations = tuple(index for index in range(3) if index != initial_state)
+        fixed_sum = sum(
+            fixed.get(_transition_name(destination, initial_state), 0.0)
+            for destination in destinations
+        )
+        remaining = 1.0 - fixed_sum
+        free_destinations = tuple(
+            destination
+            for destination in destinations
+            if _transition_name(destination, initial_state) not in fixed
+        )
+        free_and_stay = np.array(
+            [
+                transition[destination, initial_state]
+                for destination in free_destinations
+            ]
+            + [transition[initial_state, initial_state]],
+            dtype=np.float64,
+        )
+        free_and_stay = np.clip(free_and_stay, 1e-12, None)
+        free_and_stay *= remaining / np.sum(free_and_stay)
+        stay = free_and_stay[-1]
+        values.extend(np.log(free_and_stay[:-1] / stay))
+    for protocol in PROTOCOL_ORDER:
+        values.extend(
+            _simplex_logits(initial[protocol], anchor=_INITIAL_ANCHORS[protocol])
+        )
+    return np.clip(np.asarray(values, dtype=np.float64), -25.0, 25.0)
 
 
 def _validate_covariance_rcond(value: float, *, name: str) -> float:
@@ -749,44 +1053,21 @@ def _simplex_logits(
     return np.log(clipped[list(destinations)] / clipped[anchor])
 
 
-def transition_matrix_from_parameters(
-    parameters: NDArray[np.float64],
-) -> NDArray[np.float64]:
-    """Decode the first six fit parameters into `T[final, initial]`."""
-    matrix = np.zeros((3, 3), dtype=np.float64)
-    for initial_state in range(3):
-        probabilities = _simplex_from_logits(
-            parameters[2 * initial_state : 2 * initial_state + 2],
-            anchor=initial_state,
-        )
-        matrix[:, initial_state] = probabilities
-    return matrix
-
-
-def initial_populations_from_parameters(
-    parameters: NDArray[np.float64],
-) -> dict[str, NDArray[np.float64]]:
-    """Decode the final six fit parameters into three latent populations."""
-    return {
-        protocol: _simplex_from_logits(
-            parameters[6 + 2 * index : 8 + 2 * index],
-            anchor=_INITIAL_ANCHORS[protocol],
-        )
-        for index, protocol in enumerate(PROTOCOL_ORDER)
-    }
-
-
-def _predictions(
+def _model_predictions(
     parameters: NDArray[np.float64],
     repetition_counts: NDArray[np.int64],
+    spec: _TransitionModelSpec,
 ) -> dict[str, NDArray[np.float64]]:
-    """Evaluate all population trajectories in protocol/count order."""
-    transition = transition_matrix_from_parameters(parameters)
-    initial = initial_populations_from_parameters(parameters)
+    """Evaluate population trajectories for one transition-model specification."""
+    transition, initial_populations = _decode_model_parameters(parameters, spec)
+    propagators = {
+        int(count): np.linalg.matrix_power(transition, int(count))
+        for count in repetition_counts
+    }
     return {
         protocol: np.stack(
             [
-                np.linalg.matrix_power(transition, int(count)) @ initial[protocol]
+                propagators[int(count)] @ initial_populations[protocol]
                 for count in repetition_counts
             ]
         )
@@ -859,15 +1140,25 @@ def _identity_biased_guess(
     return np.concatenate((transition_logits, initial_logits))
 
 
-def _physical_vector(parameters: NDArray[np.float64]) -> NDArray[np.float64]:
-    """Return six transitions followed by all three initial populations."""
-    matrix = transition_matrix_from_parameters(parameters)
-    initial = initial_populations_from_parameters(parameters)
+def _model_physical_vector(
+    parameters: NDArray[np.float64],
+    spec: _TransitionModelSpec,
+) -> NDArray[np.float64]:
+    """Return public physical quantities for one model parameter vector."""
+    matrix, initial_populations = _decode_model_parameters(parameters, spec)
     transitions = np.array(
-        [matrix[final, initial] for _, final, initial in TRANSITION_MATRIX_INDICES],
+        [
+            matrix[final_state, initial_state]
+            for _, final_state, initial_state in TRANSITION_MATRIX_INDICES
+        ],
         dtype=np.float64,
     )
-    return np.concatenate((transitions, *(initial[name] for name in PROTOCOL_ORDER)))
+    return np.concatenate(
+        (
+            transitions,
+            *(initial_populations[name] for name in PROTOCOL_ORDER),
+        )
+    )
 
 
 def _numerical_jacobian(
@@ -910,17 +1201,41 @@ def _estimate(
 
 def _derived_estimate(
     physical: NDArray[np.float64],
-    covariance: NDArray[np.float64],
+    parameter_covariance: NDArray[np.float64],
+    physical_transform: NDArray[np.float64],
+    null_space: NDArray[np.float64],
     weights: NDArray[np.float64],
 ) -> ProbabilityEstimate:
-    """Propagate correlated transition uncertainty to a linear metric."""
+    """Propagate uncertainty for an independently tested linear metric."""
+    parameter_gradient = weights @ physical_transform[: len(TRANSITION_ORDER)]
+    if not _gradient_is_estimable(parameter_gradient, null_space):
+        return _estimate(float(weights @ physical[:6]), float("nan"))
     return _estimate(
         float(weights @ physical[:6]),
-        float(weights @ covariance[:6, :6] @ weights),
+        float(parameter_gradient @ parameter_covariance @ parameter_gradient),
     )
 
 
-def _failed_fit(message: str) -> ReadoutMistMatrixFit:
+def _gradient_is_estimable(
+    gradient: NDArray[np.float64],
+    null_space: NDArray[np.float64],
+) -> bool:
+    """Return whether a scalar quantity is insensitive to local null directions."""
+    gradient_norm = float(np.linalg.norm(gradient))
+    if gradient_norm == 0.0:
+        return False
+    if null_space.size == 0:
+        return True
+    unresolved = float(np.linalg.norm(null_space @ gradient))
+    return unresolved <= _ESTIMABILITY_RELATIVE_TOLERANCE * gradient_norm
+
+
+def _failed_fit(
+    message: str,
+    *,
+    model_name: str = "full",
+    free_parameter_count: int = _PARAMETER_COUNT,
+) -> ReadoutMistMatrixFit:
     """Build a stable unavailable fit result."""
     estimates = {
         name: ProbabilityEstimate(
@@ -954,22 +1269,26 @@ def _failed_fit(message: str) -> ReadoutMistMatrixFit:
         goodness_of_fit=goodness,
         whitened_residual=np.empty(0),
         message=message,
+        model_name=model_name,
+        free_parameter_count=free_parameter_count,
+        jacobian_nullity=free_parameter_count,
+        parameter_estimable=dict.fromkeys(_PHYSICAL_PARAMETER_ORDER, False),
     )
 
 
-def _fit_condition(
+def _condition_series_and_blocks(
     measurements: ReadoutMistMeasurements,
     *,
     reference: bool,
     covariance_rcond: float,
-) -> ReadoutMistMatrixFit:
-    """Fit actual or reference trajectories with the full 12-parameter model."""
+) -> tuple[dict[str, GefPopulationSeries], list[ResidualBlock]] | None:
+    """Collect one condition's series and matching covariance whiteners."""
     series = {}
     for protocol in PROTOCOL_ORDER:
         condition = measurements.protocols[protocol]
         value = condition.reference if reference else condition.actual
         if value is None:
-            return _failed_fit("Reference populations were not acquired.")
+            return None
         series[protocol] = value
     blocks = [
         ResidualBlock(
@@ -982,10 +1301,61 @@ def _fit_condition(
         for protocol in PROTOCOL_ORDER
         for index in range(measurements.repetition_counts.size)
     ]
+    return series, blocks
+
+
+def _model_initializations(
+    populations: Mapping[str, NDArray[np.float64]],
+    repetition_counts: NDArray[np.int64],
+    spec: _TransitionModelSpec,
+    preferred: tuple[NDArray[np.float64], Mapping[str, NDArray[np.float64]]] | None,
+) -> tuple[NDArray[np.float64], ...]:
+    """Build physical-consistent starts for a full or constrained model."""
+    full_starts = (
+        _transition_initial_guess(populations, repetition_counts),
+        _identity_biased_guess(populations, repetition_counts, 1e-3),
+        _identity_biased_guess(populations, repetition_counts, 1e-2),
+    )
+    physical_starts: list[
+        tuple[NDArray[np.float64], Mapping[str, NDArray[np.float64]]]
+    ] = [
+        _decode_model_parameters(parameters, _FULL_MODEL) for parameters in full_starts
+    ]
+    if preferred is not None:
+        physical_starts.insert(0, preferred)
+    return tuple(
+        _encode_model_parameters(transition, initial, spec)
+        for transition, initial in physical_starts
+    )
+
+
+def _fit_model_condition(
+    measurements: ReadoutMistMeasurements,
+    *,
+    reference: bool,
+    covariance_rcond: float,
+    spec: _TransitionModelSpec,
+    preferred: tuple[NDArray[np.float64], Mapping[str, NDArray[np.float64]]]
+    | None = None,
+) -> ReadoutMistMatrixFit:
+    """Fit one condition with a full, reduced, or profile model."""
+    prepared = _condition_series_and_blocks(
+        measurements,
+        reference=reference,
+        covariance_rcond=covariance_rcond,
+    )
+    parameter_count = _model_transition_parameter_count(spec) + 2 * len(PROTOCOL_ORDER)
+    if prepared is None:
+        return _failed_fit(
+            "Reference populations were not acquired.",
+            model_name=spec.name,
+            free_parameter_count=parameter_count,
+        )
+    series, blocks = prepared
     populations = {name: series[name].population for name in PROTOCOL_ORDER}
 
     def block_predictions(parameters: NDArray[np.float64]) -> list[NDArray[np.float64]]:
-        predicted = _predictions(parameters, measurements.repetition_counts)
+        predicted = _model_predictions(parameters, measurements.repetition_counts, spec)
         return [
             predicted[protocol][index]
             for protocol in PROTOCOL_ORDER
@@ -995,34 +1365,58 @@ def _fit_condition(
     def residual(parameters: NDArray[np.float64]) -> NDArray[np.float64]:
         return whiten_predictions(block_predictions(parameters), blocks)
 
-    initializations = (
-        _transition_initial_guess(populations, measurements.repetition_counts),
-        _identity_biased_guess(
-            populations,
-            measurements.repetition_counts,
-            1e-3,
-        ),
-        _identity_biased_guess(
-            populations,
-            measurements.repetition_counts,
-            1e-2,
-        ),
+    initializations = _model_initializations(
+        populations,
+        measurements.repetition_counts,
+        spec,
+        preferred,
     )
     fitted = fit_full_gls(
         residual,
         initializations,
-        parameter_count=_PARAMETER_COUNT,
+        parameter_count=parameter_count,
     )
     if not fitted.success:
-        return _failed_fit(fitted.message)
-    physical = _physical_vector(fitted.parameters)
-    transform = _numerical_jacobian(_physical_vector, fitted.parameters)
-    covariance = transform @ fitted.covariance @ transform.T
-    covariance = 0.5 * (covariance + covariance.T)
-    transition_estimates = {
-        name: _estimate(physical[index], covariance[index, index])
-        for index, name in enumerate(TRANSITION_ORDER)
+        return _failed_fit(
+            fitted.message,
+            model_name=spec.name,
+            free_parameter_count=parameter_count,
+        )
+    physical_function = lambda parameters: _model_physical_vector(parameters, spec)
+    physical = physical_function(fitted.parameters)
+    transform = _numerical_jacobian(physical_function, fitted.parameters)
+    raw_covariance = transform @ fitted.covariance @ transform.T
+    raw_covariance = 0.5 * (raw_covariance + raw_covariance.T)
+    fixed = dict(spec.fixed_probabilities)
+    estimable = {
+        name: (
+            name not in fixed
+            and _gradient_is_estimable(transform[index], fitted.null_space)
+        )
+        for index, name in enumerate(_PHYSICAL_PARAMETER_ORDER)
     }
+    covariance = raw_covariance.copy()
+    unresolved_indices = [
+        index
+        for index, name in enumerate(_PHYSICAL_PARAMETER_ORDER)
+        if not estimable[name]
+    ]
+    covariance[unresolved_indices, :] = np.nan
+    covariance[:, unresolved_indices] = np.nan
+    transition_estimates = {}
+    for index, name in enumerate(TRANSITION_ORDER):
+        if name in fixed:
+            transition_estimates[name] = ProbabilityEstimate(
+                value=float(physical[index]),
+                standard_error=None,
+                status=ReadoutMistProbabilityStatus.NOMINAL_ZERO_UNRESOLVED,
+                uncertainty_method="fixed_by_model",
+            )
+        else:
+            transition_estimates[name] = _estimate(
+                physical[index],
+                raw_covariance[index, index] if estimable[name] else float("nan"),
+            )
     transition_index = {name: index for index, name in enumerate(TRANSITION_ORDER)}
 
     def weights(**values: float) -> NDArray[np.float64]:
@@ -1039,14 +1433,24 @@ def _fit_condition(
         "seepage_from_f": weights(f_to_g=1.0, f_to_e=1.0),
     }
     derived = {
-        name: _derived_estimate(physical, covariance, weights)
+        name: _derived_estimate(
+            physical,
+            fitted.covariance,
+            transform,
+            fitted.null_space,
+            weights,
+        )
         for name, weights in derived_weights.items()
     }
-    initial_populations = initial_populations_from_parameters(fitted.parameters)
-    predicted = _predictions(fitted.parameters, measurements.repetition_counts)
+    transition_matrix, initial_populations = _decode_model_parameters(
+        fitted.parameters, spec
+    )
+    predicted = _model_predictions(
+        fitted.parameters, measurements.repetition_counts, spec
+    )
     return ReadoutMistMatrixFit(
         success=True,
-        transition_matrix=transition_matrix_from_parameters(fitted.parameters),
+        transition_matrix=transition_matrix,
         transition_probabilities=transition_estimates,
         derived_metrics=derived,
         initial_populations=initial_populations,
@@ -1056,6 +1460,28 @@ def _fit_condition(
         goodness_of_fit=fitted.goodness_of_fit,
         whitened_residual=fitted.whitened_residual,
         message=fitted.message,
+        model_name=spec.name,
+        free_parameter_count=parameter_count,
+        objective=fitted.objective,
+        jacobian_rank=fitted.jacobian_rank,
+        jacobian_nullity=fitted.jacobian_nullity,
+        jacobian_singular_values=fitted.jacobian_singular_values,
+        parameter_estimable=estimable,
+    )
+
+
+def _fit_condition(
+    measurements: ReadoutMistMeasurements,
+    *,
+    reference: bool,
+    covariance_rcond: float,
+) -> ReadoutMistMatrixFit:
+    """Fit actual or reference trajectories with the full transition model."""
+    return _fit_model_condition(
+        measurements,
+        reference=reference,
+        covariance_rcond=covariance_rcond,
+        spec=_FULL_MODEL,
     )
 
 
@@ -1127,12 +1553,231 @@ def _population_model_warnings(
     return tuple(warnings)
 
 
+def _validate_profile_confidence_level(value: float) -> float:
+    """Validate a one-sided profile-likelihood confidence level."""
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise TypeError("profile_confidence_level must be a real number.")
+    normalized = float(value)
+    if not np.isfinite(normalized) or not 0.5 < normalized < 1.0:
+        raise ValueError("profile_confidence_level must be strictly between 0.5 and 1.")
+    return normalized
+
+
+def _aicc(fit: ReadoutMistMatrixFit) -> float:
+    """Return AICc for a Gaussian GLS fit, omitting model-independent constants."""
+    observation_count = fit.whitened_residual.size
+    parameter_count = fit.free_parameter_count
+    if (
+        not fit.success
+        or not np.isfinite(fit.objective)
+        or observation_count <= parameter_count + 1
+    ):
+        return float("inf")
+    return float(
+        fit.objective
+        + 2.0 * parameter_count
+        + 2.0
+        * parameter_count
+        * (parameter_count + 1)
+        / (observation_count - parameter_count - 1)
+    )
+
+
+def _compare_transition_models(
+    measurements: ReadoutMistMeasurements,
+    *,
+    reference: bool,
+    covariance_rcond: float,
+    full_fit: ReadoutMistMatrixFit,
+) -> ReadoutMistModelComparison:
+    """Compare the full fit with the predefined physically useful reductions."""
+    preferred = (
+        (
+            full_fit.transition_matrix,
+            full_fit.initial_populations,
+        )
+        if full_fit.success
+        else None
+    )
+    fits = {"full": full_fit}
+    for spec in _REDUCED_MODEL_SPECS:
+        fits[spec.name] = _fit_model_condition(
+            measurements,
+            reference=reference,
+            covariance_rcond=covariance_rcond,
+            spec=spec,
+            preferred=preferred,
+        )
+    scores = {name: _aicc(fit) for name, fit in fits.items()}
+    finite_scores = [score for score in scores.values() if np.isfinite(score)]
+    minimum = min(finite_scores) if finite_scores else float("inf")
+    candidates = {
+        name: ReadoutMistModelCandidate(
+            fit=fit,
+            aicc=scores[name],
+            delta_aicc=(
+                scores[name] - minimum if np.isfinite(minimum) else float("inf")
+            ),
+        )
+        for name, fit in fits.items()
+    }
+    eligible = [
+        candidate
+        for candidate in candidates.values()
+        if candidate.delta_aicc <= _MODEL_SELECTION_DELTA_AICC
+        and candidate.fit.fit_quality is ReadoutMistFitQuality.ACCEPTED
+    ]
+    selected = (
+        min(
+            eligible,
+            key=lambda candidate: (
+                candidate.fit.free_parameter_count,
+                candidate.aicc,
+                candidate.fit.model_name,
+            ),
+        ).fit.model_name
+        if eligible
+        else None
+    )
+    return ReadoutMistModelComparison(
+        candidates=candidates,
+        selected_model=selected,
+        delta_aicc_threshold=_MODEL_SELECTION_DELTA_AICC,
+    )
+
+
+def _profile_upper_bound(
+    measurements: ReadoutMistMeasurements,
+    *,
+    reference: bool,
+    covariance_rcond: float,
+    full_fit: ReadoutMistMatrixFit,
+    transition_name: str,
+    confidence_level: float,
+) -> tuple[float | None, str | None]:
+    """Find a one-sided conditional profile-likelihood upper bound."""
+    if not full_fit.success:
+        return None, "central_fit_failed"
+    if full_fit.fit_quality is not ReadoutMistFitQuality.ACCEPTED:
+        return None, "fit_quality_not_accepted"
+    estimate = full_fit.transition_probabilities[transition_name]
+    lower = float(np.clip(estimate.value, 0.0, 1.0 - 1e-9))
+    threshold = float(chi2.ppf(2.0 * confidence_level - 1.0, df=1))
+    preferred = (full_fit.transition_matrix, full_fit.initial_populations)
+    cache: dict[float, float] = {}
+
+    def delta(probability: float) -> float:
+        key = float(probability)
+        if key not in cache:
+            profile = _fit_model_condition(
+                measurements,
+                reference=reference,
+                covariance_rcond=covariance_rcond,
+                spec=_TransitionModelSpec(
+                    f"profile_{transition_name}",
+                    ((transition_name, key),),
+                ),
+                preferred=preferred,
+            )
+            cache[key] = (
+                max(0.0, profile.objective - full_fit.objective)
+                if profile.success and np.isfinite(profile.objective)
+                else float("nan")
+            )
+        return cache[key]
+
+    left = lower
+    right = max(left + 1e-6, 2.0 * max(left, 1e-6))
+    right = min(right, 1.0 - 1e-9)
+    right_delta = delta(right)
+    if not np.isfinite(right_delta):
+        return None, "profile_fit_failed"
+    while right_delta < threshold and right < 1.0 - 1e-9:
+        left = right
+        right = min(max(2.0 * right, right + 1e-4), 1.0 - 1e-9)
+        right_delta = delta(right)
+        if not np.isfinite(right_delta):
+            return None, "profile_fit_failed"
+    if right_delta < threshold:
+        return None, "not_constrained_below_physical_limit"
+    for _ in range(20):
+        midpoint = 0.5 * (left + right)
+        midpoint_delta = delta(midpoint)
+        if not np.isfinite(midpoint_delta):
+            return None, "profile_fit_failed"
+        if midpoint_delta < threshold:
+            left = midpoint
+        else:
+            right = midpoint
+    return float(right), None
+
+
+def _add_profile_upper_bounds(
+    measurements: ReadoutMistMeasurements,
+    *,
+    reference: bool,
+    covariance_rcond: float,
+    fit: ReadoutMistMatrixFit,
+    confidence_level: float,
+) -> ReadoutMistMatrixFit:
+    """Attach bounds to transitions not resolved from zero by local covariance."""
+    estimates = dict(fit.transition_probabilities)
+    for name, estimate in estimates.items():
+        if estimate.status is ReadoutMistProbabilityStatus.RESOLVED:
+            continue
+        upper_bound, reason = _profile_upper_bound(
+            measurements,
+            reference=reference,
+            covariance_rcond=covariance_rcond,
+            full_fit=fit,
+            transition_name=name,
+            confidence_level=confidence_level,
+        )
+        status = estimate.status
+        method = estimate.uncertainty_method
+        if upper_bound is not None:
+            method = (
+                "profile_likelihood"
+                if estimate.standard_error is None
+                else "local_gls_and_profile_likelihood"
+            )
+            if estimate.standard_error is None:
+                status = ReadoutMistProbabilityStatus.UPPER_BOUND_ONLY
+        estimates[name] = replace(
+            estimate,
+            status=status,
+            upper_bound=upper_bound,
+            upper_bound_confidence_level=(
+                confidence_level if upper_bound is not None else None
+            ),
+            uncertainty_method=method,
+            unavailable_reason=reason,
+        )
+    return replace(fit, transition_probabilities=estimates)
+
+
 def analyze_readout_mist(
     measurements: ReadoutMistMeasurements,
     *,
     covariance_rcond: float = 1e-12,
+    compute_profile_upper_bounds: bool = False,
+    profile_confidence_level: float = 0.95,
+    fit_reduced_models: bool = False,
 ) -> ReadoutMistAnalysis:
-    """Fit actual and optional blank-reference readout-MIST trajectories."""
+    """
+    Fit full MIST dynamics and optional profile/reduced-model diagnostics.
+
+    Profile upper bounds and local covariance treat the supplied GEF calibration
+    as fixed. Reduced models are diagnostic candidates; the primary `actual` and
+    `reference` results always use the full six-transition model.
+    """
+    for name, value in (
+        ("compute_profile_upper_bounds", compute_profile_upper_bounds),
+        ("fit_reduced_models", fit_reduced_models),
+    ):
+        if not isinstance(value, bool):
+            raise TypeError(f"{name} must be boolean.")
+    confidence_level = _validate_profile_confidence_level(profile_confidence_level)
     covariance_rcond = _validate_covariance_rcond(
         covariance_rcond,
         name="covariance_rcond",
@@ -1150,6 +1795,42 @@ def analyze_readout_mist(
             covariance_rcond=covariance_rcond,
         )
         if has_reference
+        else None
+    )
+    if compute_profile_upper_bounds:
+        actual = _add_profile_upper_bounds(
+            measurements,
+            reference=False,
+            covariance_rcond=covariance_rcond,
+            fit=actual,
+            confidence_level=confidence_level,
+        )
+        if reference is not None:
+            reference = _add_profile_upper_bounds(
+                measurements,
+                reference=True,
+                covariance_rcond=covariance_rcond,
+                fit=reference,
+                confidence_level=confidence_level,
+            )
+    actual_comparison = (
+        _compare_transition_models(
+            measurements,
+            reference=False,
+            covariance_rcond=covariance_rcond,
+            full_fit=actual,
+        )
+        if fit_reduced_models
+        else None
+    )
+    reference_comparison = (
+        _compare_transition_models(
+            measurements,
+            reference=True,
+            covariance_rcond=covariance_rcond,
+            full_fit=reference,
+        )
+        if fit_reduced_models and reference is not None
         else None
     )
     difference = (
@@ -1189,6 +1870,8 @@ def analyze_readout_mist(
             if estimate.status
             in {
                 ReadoutMistProbabilityStatus.CONSISTENT_WITH_ZERO,
+                ReadoutMistProbabilityStatus.UPPER_BOUND_ONLY,
+                ReadoutMistProbabilityStatus.NOMINAL_ZERO_UNRESOLVED,
                 ReadoutMistProbabilityStatus.PARTIALLY_UNRESOLVED,
             }
         )
@@ -1209,6 +1892,8 @@ def analyze_readout_mist(
         reference=reference,
         reference_difference=difference,
         warnings=tuple(warnings),
+        actual_model_comparison=actual_comparison,
+        reference_model_comparison=reference_comparison,
         metadata={
             "model": "discrete_time_column_stochastic_transition_matrix",
             "matrix_convention": "T[final_state, initial_state]",
@@ -1216,7 +1901,12 @@ def analyze_readout_mist(
             "probability_unit": "1/readout_cycle",
             "initial_condition_treatment": "latent_nuisance_with_n0_observation",
             "uncertainty": "local_gls_conditional_on_gef_calibration",
-            "reference_interpretation": "independent_blank_cycle_diagnostic",
+            "reference_interpretation": (
+                "duration_matched_blank_cycle_diagnostic" if has_reference else None
+            ),
+            "profile_upper_bounds": compute_profile_upper_bounds,
+            "profile_confidence_level": confidence_level,
+            "reduced_model_comparison": fit_reduced_models,
             "gef_objective_warning_threshold": _GEF_OBJECTIVE_WARNING_THRESHOLD,
             "gef_condition_number_warning_threshold": (
                 _GEF_CONDITION_NUMBER_WARNING_THRESHOLD
@@ -1227,7 +1917,7 @@ def analyze_readout_mist(
 
 # Acquisition, presentation, and public workflow
 
-DEFAULT_REPETITION_COUNTS = (0, 1, 2, 4, 8, 16, 32)
+DEFAULT_REPETITION_COUNTS = (0, 1, 2, 4, 8, 16, 32, 64, 128)
 DEFAULT_GEF_MEASUREMENT_N_SHOTS = 4096
 DEFAULT_GEF_CALIBRATION_N_SHOTS = 8192
 
@@ -1314,20 +2004,19 @@ def _extract_series(
 def _build_measurements(
     counts: tuple[int, ...],
     target: str,
-    actual_result: Result,
+    result: Result,
     actual_schedules: ReadoutMistSchedules,
-    reference_result: Result | None,
     reference_schedules: ReadoutMistSchedules | None,
 ) -> ReadoutMistMeasurements:
     """Build fixed-order measurement records from GEF result mappings."""
     protocols = {
         protocol: ReadoutMistConditionMeasurements(
-            actual=_extract_series(actual_result, actual_schedules, target, protocol),
+            actual=_extract_series(result, actual_schedules, target, protocol),
             reference=(
                 None
-                if reference_result is None or reference_schedules is None
+                if reference_schedules is None
                 else _extract_series(
-                    reference_result,
+                    result,
                     reference_schedules,
                     target,
                     protocol,
@@ -1342,11 +2031,38 @@ def _build_measurements(
     )
 
 
+def _select_acquisition_data(
+    data: Mapping[str, Any],
+    key: str,
+    schedules: ReadoutMistSchedules | None,
+) -> dict[str, Any] | None:
+    """Select one condition from a combined acquisition result."""
+    if schedules is None:
+        return None
+    values = cast(Mapping[str, Any], data[key])
+    return {name: values[name] for name in schedules.submitted}
+
+
+def _fitted_populations_on_integer_grid(
+    fit: ReadoutMistMatrixFit,
+    point_count: int,
+) -> dict[str, NDArray[np.float64]]:
+    """Evaluate fitted populations at every integer cycle from zero onward."""
+    trajectories = {}
+    for protocol in PROTOCOL_ORDER:
+        values = np.empty((point_count, len(STATE_ORDER)), dtype=np.float64)
+        values[0] = fit.initial_populations[protocol]
+        for index in range(1, point_count):
+            values[index] = fit.transition_matrix @ values[index - 1]
+        trajectories[protocol] = values
+    return trajectories
+
+
 def _population_figure(
     measurements: ReadoutMistMeasurements,
     analysis: ReadoutMistAnalysis,
 ) -> go.Figure:
-    """Build three protocol panels with actual/reference data and joint fits."""
+    """Plot observations and integer-cycle fitted trajectories by preparation."""
     figure = make_subplots(
         rows=3,
         cols=1,
@@ -1356,6 +2072,17 @@ def _population_figure(
     )
     colors = fitting.COLORS[:3]
     counts = measurements.repetition_counts
+    fit_counts = np.arange(int(counts[-1]) + 1, dtype=np.int64)
+    actual_fit = (
+        _fitted_populations_on_integer_grid(analysis.actual, fit_counts.size)
+        if analysis.actual.success
+        else {}
+    )
+    reference_fit = (
+        _fitted_populations_on_integer_grid(analysis.reference, fit_counts.size)
+        if analysis.reference is not None and analysis.reference.success
+        else {}
+    )
     for row, protocol in enumerate(PROTOCOL_ORDER, start=1):
         measured = measurements.protocols[protocol]
         for state_index, state in enumerate(STATE_ORDER):
@@ -1380,8 +2107,8 @@ def _population_figure(
             if analysis.actual.success:
                 figure.add_trace(
                     go.Scatter(
-                        x=counts,
-                        y=analysis.actual.fitted_populations[protocol][:, state_index],
+                        x=fit_counts,
+                        y=actual_fit[protocol][:, state_index],
                         mode="lines",
                         line={"color": colors[state_index]},
                         name=f"fit P{state}",
@@ -1416,10 +2143,8 @@ def _population_figure(
                 if analysis.reference is not None and analysis.reference.success:
                     figure.add_trace(
                         go.Scatter(
-                            x=counts,
-                            y=analysis.reference.fitted_populations[protocol][
-                                :, state_index
-                            ],
+                            x=fit_counts,
+                            y=reference_fit[protocol][:, state_index],
                             mode="lines",
                             line={"color": colors[state_index], "dash": "dot"},
                             name=f"blank fit P{state}",
@@ -1441,60 +2166,152 @@ def _population_figure(
     return figure
 
 
+def _transition_matrix_standard_error(
+    fit: ReadoutMistMatrixFit,
+) -> NDArray[np.float64]:
+    """Propagate fitted transition uncertainty to every matrix element."""
+    errors = np.full((3, 3), np.nan, dtype=np.float64)
+    indices = {name: index for index, name in enumerate(TRANSITION_ORDER)}
+    outgoing: dict[int, tuple[str, str]] = {
+        0: ("g_to_e", "g_to_f"),
+        1: ("e_to_g", "e_to_f"),
+        2: ("f_to_g", "f_to_e"),
+    }
+    for name, final_state, initial_state in TRANSITION_MATRIX_INDICES:
+        standard_error = fit.transition_probabilities[name].standard_error
+        if standard_error is not None:
+            errors[final_state, initial_state] = standard_error
+    for initial_state, names in outgoing.items():
+        selected = [indices[name] for name in names]
+        covariance = fit.parameter_covariance[np.ix_(selected, selected)]
+        if np.all(np.isfinite(covariance)):
+            variance = float(np.sum(covariance))
+            errors[initial_state, initial_state] = np.sqrt(max(variance, 0.0))
+    return errors
+
+
+def _transition_matrix_text(fit: ReadoutMistMatrixFit) -> NDArray[np.str_]:
+    """Format transition probabilities and available standard errors."""
+    errors = _transition_matrix_standard_error(fit)
+    return np.asarray(
+        [
+            [
+                (
+                    f"{value:.5f}<br>± {errors[row, column]:.2g}"
+                    if np.isfinite(errors[row, column])
+                    else f"{value:.5f}"
+                )
+                for column, value in enumerate(matrix_row)
+            ]
+            for row, matrix_row in enumerate(fit.transition_matrix)
+        ],
+        dtype=str,
+    )
+
+
 def _matrix_figure(analysis: ReadoutMistAnalysis) -> go.Figure:
-    """Build a final-by-initial transition-matrix heatmap."""
-    matrix = analysis.actual.transition_matrix
-    return go.Figure(
-        data=go.Heatmap(
-            z=matrix,
-            x=STATE_ORDER,
-            y=STATE_ORDER,
-            colorscale="Blues",
-            zmin=0.0,
-            zmax=1.0,
-            text=np.asarray(
-                [[f"{value:.5f}" for value in row] for row in matrix],
-                dtype=str,
-            ),
-            texttemplate="%{text}",
-            colorbar={"title": "Probability"},
-        ),
-        layout={
-            "title": "Transition matrix T[final, initial]",
-            "xaxis": {"title": "Initial state"},
-            "yaxis": {"title": "Final state", "autorange": "reversed"},
-            "template": "plotly_white",
+    """Compare actual/reference matrices on a low-probability-focused scale."""
+    conditions = [("Actual", analysis.actual)]
+    if analysis.reference is not None:
+        conditions.append(("Reference", analysis.reference))
+    figure = make_subplots(
+        rows=1,
+        cols=len(conditions),
+        subplot_titles=tuple(label for label, _ in conditions),
+        horizontal_spacing=0.12,
+    )
+    for column, (_, fit) in enumerate(conditions, start=1):
+        if fit.success:
+            figure.add_trace(
+                go.Heatmap(
+                    z=fit.transition_matrix,
+                    x=STATE_ORDER,
+                    y=STATE_ORDER,
+                    text=_transition_matrix_text(fit),
+                    texttemplate="%{text}",
+                    coloraxis="coloraxis",
+                    hovertemplate=(
+                        "Final %{y}<br>Initial %{x}<br>%{text}<extra></extra>"
+                    ),
+                ),
+                row=1,
+                col=column,
+            )
+        else:
+            axis_suffix = "" if column == 1 else str(column)
+            figure.add_annotation(
+                x=0.5,
+                y=0.5,
+                xref=f"x{axis_suffix} domain",
+                yref=f"y{axis_suffix} domain",
+                text="Fit unavailable",
+                showarrow=False,
+            )
+        figure.update_xaxes(title_text="Initial state", row=1, col=column)
+        figure.update_yaxes(autorange="reversed", row=1, col=column)
+    figure.update_yaxes(title_text="Final state", row=1, col=1)
+    figure.update_layout(
+        title="Transition matrix T[final, initial] (estimate ± local SE)",
+        template="plotly_white",
+        width=900 if len(conditions) == 2 else 520,
+        coloraxis={
+            "colorscale": "Blues",
+            "cmin": 0.0,
+            "cmax": 0.1,
+            "colorbar": {"title": "Probability<br>(saturated ≥ 0.1)"},
         },
     )
+    return figure
 
 
 def _print_summary(analysis: ReadoutMistAnalysis) -> None:
     """Print transition probabilities and compact fit diagnostics."""
     print("Readout MIST probabilities [1/readout_cycle]")
-    if not analysis.actual.success:
-        print(f"  fit failed: {analysis.actual.message}")
-        if analysis.warnings:
-            print(
-                "Warnings: " + ", ".join(warning.code for warning in analysis.warnings)
-            )
-        return
-    for name in TRANSITION_ORDER:
-        estimate = analysis.actual.transition_probabilities[name]
-        uncertainty = (
-            "unresolved"
-            if estimate.standard_error is None
-            else f"{estimate.value:.6g} ± {estimate.standard_error:.2g}"
-        )
-        print(f"  {name}: {uncertainty} ({estimate.status.value})")
-    goodness = analysis.actual.goodness_of_fit
-    print(
-        "Fit quality: "
-        f"{goodness.quality.value}; reduced chi-squared="
-        f"{goodness.reduced_chi_squared:.3g}; "
-        f"max |whitened residual|={goodness.maximum_absolute_whitened_residual:.3g}"
+    conditions = (
+        ("Actual", analysis.actual, analysis.actual_model_comparison),
+        ("Reference", analysis.reference, analysis.reference_model_comparison),
     )
+    for label, fit, comparison in conditions:
+        if fit is None:
+            continue
+        print(f"{label}:")
+        if not fit.success:
+            print(f"  fit failed: {fit.message}")
+            continue
+        for name in TRANSITION_ORDER:
+            estimate = fit.transition_probabilities[name]
+            uncertainty = (
+                f"{estimate.value:.6g}; local uncertainty unresolved"
+                if estimate.standard_error is None
+                else f"{estimate.value:.6g} ± {estimate.standard_error:.2g}"
+            )
+            if estimate.upper_bound is not None:
+                uncertainty += (
+                    f"; one-sided {estimate.upper_bound_confidence_level:.1%} "
+                    f"upper bound {estimate.upper_bound:.6g}"
+                )
+            elif estimate.unavailable_reason is not None:
+                uncertainty += f"; profile unavailable: {estimate.unavailable_reason}"
+            print(f"  {name}: {uncertainty} ({estimate.status.value})")
+        goodness = fit.goodness_of_fit
+        print(
+            "  Fit quality: "
+            f"{goodness.quality.value}; reduced chi-squared="
+            f"{goodness.reduced_chi_squared:.3g}; max |whitened residual|="
+            f"{goodness.maximum_absolute_whitened_residual:.3g}"
+        )
+        print(f"  Local Jacobian rank: {fit.jacobian_rank}/{fit.free_parameter_count}")
+        if comparison is not None:
+            print(f"  Selected candidate model: {comparison.selected_model or 'none'}")
     if analysis.warnings:
-        print("Warnings: " + ", ".join(warning.code for warning in analysis.warnings))
+        print("Warnings:")
+        for warning in analysis.warnings:
+            affected = (
+                f" [{', '.join(warning.affected_outputs)}]"
+                if warning.affected_outputs
+                else ""
+            )
+            print(f"  - {warning.code}: {warning.message}{affected}")
 
 
 def characterize_readout_mist(
@@ -1509,6 +2326,9 @@ def characterize_readout_mist(
     gef_calibration_n_shots: int = DEFAULT_GEF_CALIBRATION_N_SHOTS,
     shot_interval: float | None = None,
     gef_covariance_rcond: float = 1e-12,
+    compute_profile_upper_bounds: bool = False,
+    profile_confidence_level: float = 0.95,
+    fit_reduced_models: bool = False,
     acquisition_order: Literal["interleaved", "randomized", "grouped"] = "interleaved",
     acquisition_seed: int | None = 0,
     enable_tqdm: bool = True,
@@ -1525,7 +2345,8 @@ def characterize_readout_mist(
         Target qubit whose GEF transition matrix is measured.
     repetition_counts : Sequence[int] | None, optional
         Strictly increasing counts beginning with zero and containing one.
-        At least five points are required. Defaults to `(0, 1, 2, 4, 8, 16, 32)`.
+        At least five points are required. Defaults to
+        `(0, 1, 2, 4, 8, 16, 32, 64, 128)`.
     readout_cycle : PulseSchedule | None, optional
         Complete candidate cycle containing drive, optional active depletion,
         and its trailing gap. When omitted, use the configured readout pulse
@@ -1534,7 +2355,8 @@ def characterize_readout_mist(
         Trailing gap for the automatically built configured cycle, in ns.
         Must remain zero when `readout_cycle` is supplied.
     measure_reference : bool, optional
-        Whether to independently fit a duration-matched all-blank cycle.
+        Whether to fit a duration-matched all-blank cycle. Actual and reference
+        schedules are submitted as adjacent pairs in the same population batch.
     gef_measurement_n_shots : int, optional
         Shots for each of the three diagnostic GEF permutations.
     gef_calibration_n_shots : int, optional
@@ -1543,8 +2365,20 @@ def characterize_readout_mist(
         Shot interval in ns, or the configured measurement default.
     gef_covariance_rcond : float, optional
         Relative covariance eigenvalue cutoff in `[0, 1)`.
+    compute_profile_upper_bounds : bool, optional
+        Whether to compute one-sided conditional profile-likelihood upper bounds
+        for transition probabilities not resolved from zero. Disabled by default
+        because it requires additional nonlinear fits.
+    profile_confidence_level : float, optional
+        Confidence level strictly between 0.5 and 1 for profile upper bounds.
+        Defaults to 0.95.
+    fit_reduced_models : bool, optional
+        Whether to compare the full model with predefined `adjacent_only` and
+        `no_leakage` models using AICc. The full-model result remains primary.
     acquisition_order : {"interleaved", "randomized", "grouped"}, optional
-        Logical G/E/F and repetition-point submission order.
+        Logical G/E/F and repetition-point submission order. When reference
+        measurement is enabled, each logical point is submitted as an adjacent
+        actual/reference pair.
     acquisition_seed : int | None, optional
         Seed used only for randomized acquisition order.
     enable_tqdm : bool, optional
@@ -1563,19 +2397,31 @@ def characterize_readout_mist(
     This function performs hardware acquisition. Reported probabilities use
     `T[final_state, initial_state]` and units of `1/readout_cycle`. They are
     effective cycle-boundary probabilities rather than microscopic rates.
-    Uncertainty is local GLS covariance conditional on the shared GEF calibration.
+    Uncertainty is local GLS covariance conditional on the shared GEF calibration;
+    local null-space directions are assessed separately for every reported
+    quantity. Optional profile bounds and AICc model comparisons are conditional
+    on the same calibration and do not include calibration bootstrap uncertainty.
     The blank reference zeros the entire candidate cycle while preserving its
-    timing; its fitted difference is diagnostic and is not subtracted as an
-    estimate of readout-only transitions. The final GEF discriminator uses the
-    calibrated configured readout, independently of `readout_cycle`. If the
-    candidate cycle also creates captures, only the last capture—the final GEF
-    diagnostic readout—is used for population estimation and retained as raw IQ.
+    timing. Actual and reference schedules are interleaved in one population
+    batch to reduce sensitivity to acquisition drift. A backend may split the
+    batch according to its schedule-packing support, while preserving submission
+    order. The actual and reference transition matrices are fitted independently;
+    their difference is diagnostic and is not subtracted as an estimate of
+    readout-only transitions. The final GEF discriminator uses the calibrated
+    configured readout, independently of `readout_cycle`. If the candidate cycle
+    also creates captures, only the last capture—the final GEF diagnostic
+    readout—is used for population estimation and retained as raw IQ.
+    Population-fit curves are evaluated at every integer cycle through the largest
+    requested repetition. Transition-matrix heatmaps show local standard errors
+    when available and saturate their shared color scale at probability 0.1.
     Consequently, diagnostic-readout backaction and population outside the closed
     GEF subspace remain model limitations and are surfaced through retained raw
     data and warnings.
     """
     for name, value in (
         ("measure_reference", measure_reference),
+        ("compute_profile_upper_bounds", compute_profile_upper_bounds),
+        ("fit_reduced_models", fit_reduced_models),
         ("enable_tqdm", enable_tqdm),
         ("plot", plot),
     ):
@@ -1596,6 +2442,7 @@ def characterize_readout_mist(
         gef_covariance_rcond,
         name="gef_covariance_rcond",
     )
+    confidence_level = _validate_profile_confidence_level(profile_confidence_level)
     seed = _optional_seed(acquisition_seed)
     configured_interval = resolve_measurement_defaults(
         exp.ctx.experiment_system.measurement_defaults
@@ -1623,23 +2470,7 @@ def characterize_readout_mist(
         acquisition_order=cast(AcquisitionOrder, acquisition_order),
         acquisition_seed=seed,
     )
-    actual_result = measure_gef_populations(
-        exp,
-        targets=[resolved_target],
-        sequences=actual_schedules.submitted,
-        n_shots=measurement_shots,
-        calibration_n_shots=calibration_shots,
-        shot_interval=interval,
-        covariance_rcond=covariance_rcond,
-        n_bootstrap=0,
-        enable_tqdm=enable_tqdm,
-        progress_label="readout MIST actual",
-        capture_index=_DIAGNOSTIC_CAPTURE_INDEX,
-    )
-    actual_data = cast(Mapping[str, Any], actual_result.data)
-    calibration = actual_data["calibration"]
     reference_schedules = None
-    reference_result = None
     reference_cycle = None
     if measure_reference:
         reference_cycle = build_reference_cycle(cycle)
@@ -1652,30 +2483,46 @@ def characterize_readout_mist(
             acquisition_order=cast(AcquisitionOrder, acquisition_order),
             acquisition_seed=seed,
         )
-        reference_result = measure_gef_populations(
-            exp,
-            targets=[resolved_target],
-            sequences=reference_schedules.submitted,
-            calibration=calibration,
-            n_shots=measurement_shots,
-            shot_interval=interval,
-            covariance_rcond=covariance_rcond,
-            n_bootstrap=0,
-            enable_tqdm=enable_tqdm,
-            progress_label="readout MIST blank reference",
-            capture_index=_DIAGNOSTIC_CAPTURE_INDEX,
+        reference_schedules = _align_reference_acquisition_order(
+            actual_schedules,
+            reference_schedules,
         )
+    submitted_schedules = _interleave_acquisition_schedules(
+        actual_schedules,
+        reference_schedules,
+    )
+    acquisition_result = measure_gef_populations(
+        exp,
+        targets=[resolved_target],
+        sequences=submitted_schedules,
+        n_shots=measurement_shots,
+        calibration_n_shots=calibration_shots,
+        shot_interval=interval,
+        covariance_rcond=covariance_rcond,
+        n_bootstrap=0,
+        enable_tqdm=enable_tqdm,
+        progress_label=(
+            "readout MIST actual/reference"
+            if measure_reference
+            else "readout MIST actual"
+        ),
+        capture_index=_DIAGNOSTIC_CAPTURE_INDEX,
+    )
+    acquisition_data = cast(Mapping[str, Any], acquisition_result.data)
+    calibration = acquisition_data["calibration"]
     measurements = _build_measurements(
         counts,
         resolved_target,
-        actual_result,
+        acquisition_result,
         actual_schedules,
-        reference_result,
         reference_schedules,
     )
     analysis = analyze_readout_mist(
         measurements,
         covariance_rcond=covariance_rcond,
+        compute_profile_upper_bounds=compute_profile_upper_bounds,
+        profile_confidence_level=confidence_level,
+        fit_reduced_models=fit_reduced_models,
     )
     figures = (
         {"populations": _population_figure(measurements, analysis)} if plot else {}
@@ -1686,11 +2533,6 @@ def characterize_readout_mist(
         _print_summary(analysis)
         for figure in figures.values():
             figure.show()
-    reference_data = (
-        None
-        if reference_result is None
-        else cast(Mapping[str, Any], reference_result.data)
-    )
     measurement_options = {
         "repetition_counts": counts,
         "gef_measurement_n_shots": measurement_shots,
@@ -1701,6 +2543,10 @@ def characterize_readout_mist(
         "diagnostic_capture_index": _DIAGNOSTIC_CAPTURE_INDEX,
         "acquisition_order": acquisition_order,
         "acquisition_seed": seed,
+        "reference_acquisition": (
+            "same_batch_adjacent_pairs" if measure_reference else None
+        ),
+        "submitted_sequence_order": tuple(submitted_schedules),
         "enable_tqdm": enable_tqdm,
         "plot": plot,
     }
@@ -1710,26 +2556,43 @@ def characterize_readout_mist(
             "analysis": analysis,
             "raw_data": {
                 "gef_calibration": calibration,
-                "actual_raw_iq": actual_data["raw_iq"],
-                "actual_moment_summaries": actual_data["moment_summaries"],
-                "actual_population_fits": actual_data["fits"],
-                "reference_raw_iq": (
-                    None if reference_data is None else reference_data["raw_iq"]
+                "actual_raw_iq": _select_acquisition_data(
+                    acquisition_data,
+                    "raw_iq",
+                    actual_schedules,
                 ),
-                "reference_moment_summaries": (
-                    None
-                    if reference_data is None
-                    else reference_data["moment_summaries"]
+                "actual_moment_summaries": _select_acquisition_data(
+                    acquisition_data,
+                    "moment_summaries",
+                    actual_schedules,
                 ),
-                "reference_population_fits": (
-                    None if reference_data is None else reference_data["fits"]
+                "actual_population_fits": _select_acquisition_data(
+                    acquisition_data,
+                    "fits",
+                    actual_schedules,
+                ),
+                "reference_raw_iq": _select_acquisition_data(
+                    acquisition_data,
+                    "raw_iq",
+                    reference_schedules,
+                ),
+                "reference_moment_summaries": _select_acquisition_data(
+                    acquisition_data,
+                    "moment_summaries",
+                    reference_schedules,
+                ),
+                "reference_population_fits": _select_acquisition_data(
+                    acquisition_data,
+                    "fits",
+                    reference_schedules,
                 ),
             },
             "measurement_options": measurement_options,
             "analysis_options": {
                 "model": "full_six_transition_discrete_time_matrix",
-                "reduced_models": False,
-                "profile_upper_bounds": False,
+                "reduced_models": fit_reduced_models,
+                "profile_upper_bounds": compute_profile_upper_bounds,
+                "profile_confidence_level": confidence_level,
                 "calibration_bootstrap": False,
                 "uncertainty": "local_gls_conditional_on_gef_calibration",
             },

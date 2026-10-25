@@ -14,7 +14,7 @@ from qubex.contrib.experiment.readout_mist import (
 
 
 def test_converged_central_fit_survives_unresolved_local_covariance() -> None:
-    """A rank-deficient Jacobian should preserve its converged central estimate."""
+    """A rank-deficient fit should retain its identifiable covariance subspace."""
     result = fit_full_gls(
         lambda parameters: np.array([parameters[0] - 0.25]),
         (np.array([0.0, 0.0]),),
@@ -23,7 +23,10 @@ def test_converged_central_fit_survives_unresolved_local_covariance() -> None:
 
     assert result.success
     assert result.parameters[0] == pytest.approx(0.25, rel=0.0, abs=1e-8)
-    assert np.all(np.isnan(result.covariance))
+    assert result.jacobian_rank == 1
+    assert result.jacobian_nullity == 1
+    assert result.null_space.shape == (1, 2)
+    assert np.all(np.isfinite(result.covariance))
     assert "not locally identifiable" in result.message
 
 

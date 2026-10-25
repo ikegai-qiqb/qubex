@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+from typing import cast
+
 import numpy as np
+import plotly.graph_objects as go
 import pytest
 
 import qubex.contrib.experiment.readout_mist as mist_module
@@ -12,6 +16,11 @@ from qubex.contrib.experiment.readout_mist import (
     GefPopulationSeries,
     ReadoutMistConditionMeasurements,
     ReadoutMistMeasurements,
+    _failed_fit,
+    _matrix_figure,
+    _population_figure,
+    _profile_upper_bound,
+    _transition_matrix_standard_error,
     analyze_readout_mist,
 )
 
@@ -26,6 +35,13 @@ def _synthetic_measurements() -> tuple[ReadoutMistMeasurements, np.ndarray]:
         ],
         dtype=np.float64,
     )
+    return _measurements_from_transition(transition), transition
+
+
+def _measurements_from_transition(
+    transition: np.ndarray,
+) -> ReadoutMistMeasurements:
+    """Build deterministic trajectories for one supplied transition matrix."""
     initial: dict[str, np.ndarray] = {
         "initial_g": np.array([0.985, 0.012, 0.003], dtype=np.float64),
         "initial_e": np.array([0.018, 0.971, 0.011], dtype=np.float64),
@@ -51,7 +67,7 @@ def _synthetic_measurements() -> tuple[ReadoutMistMeasurements, np.ndarray]:
             ),
             reference=None,
         )
-    return ReadoutMistMeasurements(counts, protocols), transition
+    return ReadoutMistMeasurements(counts, protocols)
 
 
 def test_joint_fit_recovers_transition_matrix_and_initial_populations() -> None:
@@ -74,6 +90,9 @@ def test_joint_fit_recovers_transition_matrix_and_initial_populations() -> None:
     )
     assert np.all(analysis.actual.transition_matrix >= 0.0)
     assert analysis.actual.fit_quality.value == "accepted"
+    assert analysis.actual.jacobian_rank == analysis.actual.free_parameter_count
+    assert all(analysis.actual.parameter_estimable.values())
+    assert analysis.metadata["reference_interpretation"] is None
 
 
 def test_transition_names_follow_final_by_initial_matrix_convention() -> None:
@@ -112,6 +131,140 @@ def test_transition_names_follow_final_by_initial_matrix_convention() -> None:
         "e_to_f",
         "f_to_g",
         "f_to_e",
+    )
+
+
+def test_profile_bounds_and_reduced_models_handle_nominally_zero_transitions() -> None:
+    """Boundary transitions should get upper bounds and a simpler candidate fit."""
+    transition = np.array(
+        [
+            [0.990, 0.020, 0.000],
+            [0.010, 0.970, 0.030],
+            [0.000, 0.010, 0.970],
+        ],
+        dtype=np.float64,
+    )
+    measurements = _measurements_from_transition(transition)
+
+    analysis = analyze_readout_mist(
+        measurements,
+        compute_profile_upper_bounds=True,
+        profile_confidence_level=0.95,
+        fit_reduced_models=True,
+    )
+
+    for name in ("g_to_f", "f_to_g"):
+        estimate = analysis.actual.transition_probabilities[name]
+        assert estimate.upper_bound is not None
+        assert estimate.upper_bound >= estimate.value
+        assert estimate.upper_bound_confidence_level == pytest.approx(0.95)
+        assert estimate.status.value == "upper_bound_only"
+    for name in ("g_to_e", "e_to_g", "e_to_f", "f_to_e"):
+        assert analysis.actual.transition_probabilities[name].status.value == "resolved"
+    comparison = analysis.actual_model_comparison
+    assert comparison is not None
+    assert set(comparison.candidates) == {"full", "adjacent_only", "no_leakage"}
+    assert comparison.candidates["full"].fit is analysis.actual
+    assert comparison.selected_model == "adjacent_only"
+    adjacent = comparison.candidates["adjacent_only"].fit
+    assert adjacent.transition_probabilities["g_to_f"].status.value == (
+        "nominal_zero_unresolved"
+    )
+
+
+def test_profile_fit_failure_does_not_create_a_false_upper_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed constrained fit should make the profile bound unavailable."""
+    measurements, _ = _synthetic_measurements()
+    full_fit = analyze_readout_mist(measurements).actual
+    monkeypatch.setattr(
+        mist_module,
+        "_fit_model_condition",
+        lambda *args, **kwargs: _failed_fit("synthetic failure"),
+    )
+
+    upper_bound, reason = _profile_upper_bound(
+        measurements,
+        reference=False,
+        covariance_rcond=1e-12,
+        full_fit=full_fit,
+        transition_name="g_to_f",
+        confidence_level=0.95,
+    )
+
+    assert upper_bound is None
+    assert reason == "profile_fit_failed"
+
+
+def test_population_figure_evaluates_fit_at_every_integer_repetition() -> None:
+    """Fit lines should use every integer repetition through the largest count."""
+    measurements, _ = _synthetic_measurements()
+    analysis = analyze_readout_mist(measurements)
+
+    figure = _population_figure(measurements, analysis)
+    traces = cast(tuple[go.Scatter, ...], figure.data)
+
+    fit_trace = next(trace for trace in traces if trace.name == "fit Pg")
+    np.testing.assert_array_equal(
+        np.asarray(fit_trace.x),
+        np.arange(int(measurements.repetition_counts[-1]) + 1),
+    )
+
+
+def test_matrix_figure_compares_actual_and_reference_with_uncertainty() -> None:
+    """Matrix panels should share a 0.1-saturated scale and show available errors."""
+    measurements, _ = _synthetic_measurements()
+    with_reference = ReadoutMistMeasurements(
+        measurements.repetition_counts,
+        {
+            name: ReadoutMistConditionMeasurements(
+                actual=condition.actual,
+                reference=condition.actual,
+            )
+            for name, condition in measurements.protocols.items()
+        },
+    )
+    analysis = analyze_readout_mist(with_reference)
+
+    figure = _matrix_figure(analysis)
+    traces = cast(tuple[go.Heatmap, ...], figure.data)
+    errors = _transition_matrix_standard_error(analysis.actual)
+    covariance = analysis.actual.parameter_covariance
+    expected_g_stay_error = np.sqrt(np.sum(covariance[np.ix_([0, 2], [0, 2])]))
+
+    assert len(traces) == 2
+    assert analysis.metadata["reference_interpretation"] == (
+        "duration_matched_blank_cycle_diagnostic"
+    )
+    assert figure.layout.coloraxis.cmin == pytest.approx(0.0)
+    assert figure.layout.coloraxis.cmax == pytest.approx(0.1)
+    assert [annotation.text for annotation in figure.layout.annotations] == [
+        "Actual",
+        "Reference",
+    ]
+    for trace in traces:
+        text = np.asarray(trace.text)
+        assert "±" in text[0, 0]
+        assert "±" in text[1, 0]
+    assert errors[0, 0] == pytest.approx(expected_g_stay_error)
+    assert errors[1, 0] == pytest.approx(
+        analysis.actual.transition_probabilities["g_to_e"].standard_error
+    )
+
+
+def test_matrix_figure_marks_a_failed_reference_fit_as_unavailable() -> None:
+    """A failed reference fit should not produce a meaningless NaN heatmap."""
+    measurements, _ = _synthetic_measurements()
+    analysis = analyze_readout_mist(measurements)
+    failed_reference = _failed_fit("synthetic failure")
+
+    figure = _matrix_figure(replace(analysis, reference=failed_reference))
+    traces = cast(tuple[go.Heatmap, ...], figure.data)
+
+    assert len(traces) == 1
+    assert any(
+        annotation.text == "Fit unavailable" for annotation in figure.layout.annotations
     )
 
 
