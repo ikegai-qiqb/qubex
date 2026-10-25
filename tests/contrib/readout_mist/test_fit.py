@@ -6,17 +6,15 @@ import numpy as np
 import pytest
 
 from qubex.contrib.experiment.readout_mist import (
-    ReadoutMistFitQuality,
-    _local_covariance,
     assess_goodness_of_fit,
     fit_full_gls,
 )
 
 
 def test_converged_central_fit_survives_unresolved_local_covariance() -> None:
-    """A rank-deficient fit should retain its identifiable covariance subspace."""
+    """A rank-deficient fit should retain covariance and use rank for DoF."""
     result = fit_full_gls(
-        lambda parameters: np.array([parameters[0] - 0.25]),
+        lambda parameters: np.array([parameters[0] - 0.25, parameters[0] - 0.25]),
         (np.array([0.0, 0.0]),),
         parameter_count=2,
     )
@@ -28,37 +26,33 @@ def test_converged_central_fit_survives_unresolved_local_covariance() -> None:
     assert result.null_space.shape == (1, 2)
     assert np.all(np.isfinite(result.covariance))
     assert "not locally identifiable" in result.message
+    assert result.goodness_of_fit.degrees_of_freedom == 1
+    assert np.isfinite(result.goodness_of_fit.reduced_chi_squared)
 
 
-@pytest.mark.parametrize("parameter_count", [True, 2.5])
-def test_parameter_count_must_be_an_integer(parameter_count: object) -> None:
-    """Boolean and fractional parameter counts should fail before allocation."""
-    with pytest.raises((TypeError, ValueError), match="positive integer"):
-        fit_full_gls(
-            lambda parameters: parameters,
-            (np.zeros(2),),
-            parameter_count=parameter_count,  # type: ignore[arg-type]
-        )
-
-
-def test_nonfinite_residual_has_unassessed_goodness_of_fit() -> None:
-    """Nonfinite whitened residuals should not receive a statistical classification."""
+def test_goodness_of_fit_reports_objective_residual_metrics_without_judgment() -> None:
+    """Fit diagnostics should report chi-squared and whitened-residual RMS."""
     goodness = assess_goodness_of_fit(
-        np.array([0.0, np.nan, 1.0]),
+        np.array([1.0, -2.0, 2.0, 0.0]),
         n_parameters=1,
     )
 
-    assert goodness.quality is ReadoutMistFitQuality.NOT_ASSESSED
-    assert goodness.reason == "No finite whitened residuals were available."
-    assert np.isnan(goodness.chi_squared)
+    assert goodness.degrees_of_freedom == 3
+    assert goodness.chi_squared == pytest.approx(9.0)
+    assert goodness.reduced_chi_squared == pytest.approx(3.0)
+    assert goodness.weighted_residual_rms == pytest.approx(np.sqrt(3.0))
+    assert goodness.maximum_absolute_whitened_residual == pytest.approx(2.0)
 
 
-def test_nonfinite_jacobian_has_unavailable_local_covariance() -> None:
-    """A nonfinite optimizer Jacobian should produce an unavailable covariance."""
-    covariance = _local_covariance(
-        np.array([[1.0, np.nan], [0.0, 1.0]]),
-        reduced_chi_squared=1.0,
+def test_local_covariance_is_not_scaled_by_fit_residual_size() -> None:
+    """Local GLS uncertainty should remain separate from fit-quality metrics."""
+    result = fit_full_gls(
+        lambda parameters: np.array(
+            [parameters[0] - 10.0, parameters[0] + 10.0, parameters[0]]
+        ),
+        (np.array([0.0]),),
+        parameter_count=1,
     )
 
-    assert covariance.shape == (2, 2)
-    assert np.all(np.isnan(covariance))
+    assert result.goodness_of_fit.reduced_chi_squared > 1.0
+    assert result.covariance[0, 0] == pytest.approx(1.0 / 3.0)

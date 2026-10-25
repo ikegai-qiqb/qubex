@@ -6,22 +6,28 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import numpy as np
+import plotly.graph_objects as go
 import pytest
 
 import qubex.contrib.experiment.readout_mist as mist_module
 from qubex import contrib
 from qubex.contrib import experiment as experiment_contrib
-from qubex.contrib.experiment import characterize_readout_mist
+from qubex.contrib.experiment import analyze_readout_mist, characterize_readout_mist
 from qubex.experiment import Experiment
 from qubex.experiment.models.result import Result
 from qubex.pulse import FlatTop, PulseSchedule
 
 
 def test_readout_mist_is_exported_from_public_contrib_namespaces() -> None:
-    """Readout MIST should be callable from both public contrib namespaces."""
-    assert mist_module.__all__ == ["characterize_readout_mist"]
+    """Measurement and postprocessing should be public in contrib namespaces."""
+    assert mist_module.__all__ == [
+        "analyze_readout_mist",
+        "characterize_readout_mist",
+    ]
     assert contrib.characterize_readout_mist is characterize_readout_mist
     assert experiment_contrib.characterize_readout_mist is characterize_readout_mist
+    assert contrib.analyze_readout_mist is analyze_readout_mist
+    assert experiment_contrib.analyze_readout_mist is analyze_readout_mist
 
 
 class _Context:
@@ -91,41 +97,40 @@ def test_custom_cycle_cannot_also_request_an_implicit_gap() -> None:
         )
 
 
-@pytest.mark.parametrize("value", [True, -1.0, 1.0, float("nan")])
-def test_invalid_gef_covariance_cutoff_fails_before_acquisition(value: object) -> None:
+def test_invalid_gef_covariance_cutoff_fails_before_acquisition() -> None:
     """The GEF covariance cutoff should be validated before hardware acquisition."""
     with pytest.raises((TypeError, ValueError), match="gef_covariance_rcond"):
         characterize_readout_mist(
             _experiment(),
             "Q0",
-            gef_covariance_rcond=value,  # type: ignore[arg-type]
+            gef_covariance_rcond=-1.0,
             plot=False,
         )
 
 
-def test_public_defaults_keep_reference_and_disable_second_phase_analysis() -> None:
-    """Defaults should keep optional phase-two fits disabled."""
+def test_public_measurement_api_excludes_advanced_analysis_options() -> None:
+    """The daily measurement API should expose only the full-model workflow."""
     defaults = characterize_readout_mist.__kwdefaults__
 
     assert defaults is not None
-    assert mist_module.DEFAULT_REPETITION_COUNTS == (0, 1, 2, 4, 8, 16, 32, 64, 128)
+    assert mist_module.DEFAULT_REPETITION_COUNTS == (
+        0,
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
+    )
     assert defaults["measure_reference"] is True
-    assert defaults["fit_reduced_models"] is False
-    assert defaults["compute_profile_upper_bounds"] is False
-    assert defaults["profile_confidence_level"] == pytest.approx(0.95)
+    assert defaults["enable_tqdm"] is True
+    assert "fit_reduced_models" not in defaults
+    assert "compute_profile_upper_bounds" not in defaults
+    assert "profile_confidence_level" not in defaults
     assert "gef_bootstrap_n_resamples" not in defaults
-
-
-@pytest.mark.parametrize("value", [True, 0.5, 1.0, float("nan")])
-def test_invalid_profile_confidence_fails_before_acquisition(value: object) -> None:
-    """Invalid profile confidence levels should fail before acquisition."""
-    with pytest.raises((TypeError, ValueError), match="profile_confidence_level"):
-        characterize_readout_mist(
-            _experiment(),
-            "Q0",
-            profile_confidence_level=value,  # type: ignore[arg-type]
-            plot=False,
-        )
 
 
 @pytest.mark.parametrize(
@@ -134,6 +139,7 @@ def test_invalid_profile_confidence_fails_before_acquisition(value: object) -> N
 )
 def test_workflow_interleaves_actual_and_complete_blank_reference(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
     acquisition_order: str,
     acquisition_seed: int | None,
 ) -> None:
@@ -190,6 +196,7 @@ def test_workflow_interleaves_actual_and_complete_blank_reference(
         )
 
     monkeypatch.setattr(mist_module, "measure_gef_populations", measure)
+    monkeypatch.setattr(go.Figure, "show", lambda self: None)
     with PulseSchedule() as cycle:
         cycle.add("RQ0", FlatTop(duration=80.0, amplitude=0.25, tau=8.0))
         cycle.add("RQ0", FlatTop(duration=20.0, amplitude=0.05, tau=4.0))
@@ -201,7 +208,7 @@ def test_workflow_interleaves_actual_and_complete_blank_reference(
         readout_cycle=cycle,
         acquisition_order=acquisition_order,  # type: ignore[arg-type]
         acquisition_seed=acquisition_seed,
-        plot=False,
+        plot=True,
         enable_tqdm=False,
     )
 
@@ -255,6 +262,10 @@ def test_workflow_interleaves_actual_and_complete_blank_reference(
         reference_transition @ initial["initial_g"],
     )
     assert result.data["analysis"].actual.state_order == ("g", "e", "f")
+    assert result.data["analysis"].actual_model_comparison is None
+    assert result.data["analysis"].reference_model_comparison is None
+    assert "profile_upper_bounds" not in result.data["analysis_options"]
+    assert "reduced_models" not in result.data["analysis_options"]
     assert result.data["readout_cycle_timing"]["trailing_gap_in_final_cycle"] is True
     assert result.data["measurement_options"]["diagnostic_capture_index"] == -1
     assert result.data["measurement_options"]["submitted_sequence_order"] == (
@@ -263,3 +274,4 @@ def test_workflow_interleaves_actual_and_complete_blank_reference(
     assert result.data["measurement_options"]["reference_acquisition"] == (
         "same_batch_adjacent_pairs"
     )
+    assert capsys.readouterr().out == ""

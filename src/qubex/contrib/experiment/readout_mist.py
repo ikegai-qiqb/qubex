@@ -2,16 +2,16 @@
 Characterize measurement-induced state transitions from a readout cycle.
 
 The module constructs repeated candidate and blank-reference schedules, estimates
-GEF populations, fits a shared column-stochastic transition matrix, and reports
-rank-aware conditional uncertainty, optional profile-likelihood upper bounds,
-and predefined reduced-model diagnostics.
+GEF populations, fits a shared column-stochastic transition matrix, and returns
+rank-aware local GLS uncertainty and objective residual diagnostics. Optional
+profile-likelihood bounds and reduced-model comparisons are separate
+postprocessing features.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from enum import Enum
 from itertools import pairwise
 from numbers import Integral, Real
 from typing import Any, Literal, cast
@@ -48,25 +48,6 @@ _PHYSICAL_PARAMETER_ORDER = (
     *(f"{protocol}_{state}" for protocol in PROTOCOL_ORDER for state in STATE_ORDER),
 )
 _DIAGNOSTIC_CAPTURE_INDEX = -1
-
-
-class ReadoutMistProbabilityStatus(str, Enum):
-    """Represent how one transition probability is constrained by the data."""
-
-    RESOLVED = "resolved"
-    CONSISTENT_WITH_ZERO = "consistent_with_zero"
-    UPPER_BOUND_ONLY = "upper_bound_only"
-    NOMINAL_ZERO_UNRESOLVED = "nominal_zero_unresolved"
-    PARTIALLY_UNRESOLVED = "partially_unresolved"
-    FIT_FAILED = "fit_failed"
-
-
-class ReadoutMistFitQuality(str, Enum):
-    """Represent absolute agreement with shot-noise covariance."""
-
-    ACCEPTED = "accepted"
-    STATISTICAL_MISMATCH = "statistical_mismatch"
-    NOT_ASSESSED = "not_assessed"
 
 
 @dataclass(frozen=True)
@@ -207,34 +188,37 @@ class ReadoutMistMeasurements:
 @dataclass(frozen=True)
 class ProbabilityEstimate:
     """
-    Store one probability with local uncertainty and an optional profile bound.
+    Store one probability with local GLS uncertainty and an optional profile bound.
 
-    A missing `standard_error` means that the quantity depends on a local
-    Jacobian null direction. Profile bounds are one-sided and conditional on the
-    fixed GEF calibration.
+    `estimable` records whether the probability is insensitive to local Jacobian
+    null directions. Profile bounds are advanced, one-sided diagnostics. All
+    uncertainty is conditional on the fixed GEF calibration.
     """
 
     value: float
     standard_error: float | None
-    status: ReadoutMistProbabilityStatus
+    estimable: bool
     upper_bound: float | None = None
     upper_bound_confidence_level: float | None = None
-    uncertainty_method: str = "local_gls"
-    unavailable_reason: str | None = None
+    upper_bound_unavailable_reason: str | None = None
     unit: str = "1/readout_cycle"
 
 
 @dataclass(frozen=True)
 class FitGoodnessOfFit:
-    """Store absolute fit diagnostics for whitened residuals."""
+    """
+    Store objective fit diagnostics without classifying fit quality.
+
+    Degrees of freedom are the number of whitened residual components minus the
+    numerical Jacobian rank.
+    `weighted_residual_rms` is `sqrt(chi_squared / degrees_of_freedom)`.
+    """
 
     degrees_of_freedom: int
     chi_squared: float
     reduced_chi_squared: float
-    chi_squared_p_value: float | None
+    weighted_residual_rms: float
     maximum_absolute_whitened_residual: float
-    quality: ReadoutMistFitQuality
-    reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -270,20 +254,6 @@ class ReadoutMistMatrixFit:
     state_order: tuple[str, str, str] = STATE_ORDER
     probability_unit: str = "1/readout_cycle"
 
-    @property
-    def fit_quality(self) -> ReadoutMistFitQuality:
-        """Return the nonduplicated absolute fit-quality classification."""
-        return self.goodness_of_fit.quality
-
-
-@dataclass(frozen=True)
-class ReadoutMistWarning:
-    """Describe one nonfatal limitation detected by the analysis."""
-
-    code: str
-    message: str
-    affected_outputs: tuple[str, ...] = ()
-
 
 @dataclass(frozen=True)
 class ReadoutMistModelCandidate:
@@ -296,17 +266,15 @@ class ReadoutMistModelCandidate:
 
 @dataclass(frozen=True)
 class ReadoutMistModelComparison:
-    """Store candidate fits and the simplest accepted model within the AICc band."""
+    """Store candidate fits and AICc differences without selecting a model."""
 
     candidates: dict[str, ReadoutMistModelCandidate]
-    selected_model: str | None
-    delta_aicc_threshold: float
 
 
 @dataclass(frozen=True)
 class ReadoutMistAnalysis:
     """
-    Store actual/reference fits, diagnostic differences, and warnings.
+    Store actual/reference fits and optional advanced diagnostics.
 
     `reference_difference` is the signed elementwise difference between the
     independently fitted actual and blank-reference transition probabilities.
@@ -316,7 +284,6 @@ class ReadoutMistAnalysis:
     actual: ReadoutMistMatrixFit
     reference: ReadoutMistMatrixFit | None
     reference_difference: dict[str, float] | None
-    warnings: tuple[ReadoutMistWarning, ...]
     actual_model_comparison: ReadoutMistModelComparison | None = None
     reference_model_comparison: ReadoutMistModelComparison | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -529,8 +496,6 @@ def _align_reference_acquisition_order(
 
 # Numerical fitting helpers
 
-GOODNESS_OF_FIT_REDUCED_CHI_SQUARED_LIMIT = 5.0
-GOODNESS_OF_FIT_MAX_RESIDUAL_LIMIT = 8.0
 _EPS = float(np.finfo(np.float64).eps)
 
 
@@ -617,7 +582,7 @@ def assess_goodness_of_fit(
     *,
     n_parameters: int,
 ) -> FitGoodnessOfFit:
-    """Classify absolute agreement with shot-noise-whitened observations."""
+    """Compute objective diagnostics from shot-noise-whitened residuals."""
     values = np.asarray(residual, dtype=np.float64).reshape(-1)
     degrees_of_freedom = int(values.size - n_parameters)
     if values.size == 0 or not np.all(np.isfinite(values)):
@@ -625,10 +590,8 @@ def assess_goodness_of_fit(
             degrees_of_freedom=degrees_of_freedom,
             chi_squared=float("nan"),
             reduced_chi_squared=float("nan"),
-            chi_squared_p_value=None,
+            weighted_residual_rms=float("nan"),
             maximum_absolute_whitened_residual=float("nan"),
-            quality=ReadoutMistFitQuality.NOT_ASSESSED,
-            reason="No finite whitened residuals were available.",
         )
     chi_squared = float(values @ values)
     maximum = float(np.max(np.abs(values)))
@@ -637,58 +600,21 @@ def assess_goodness_of_fit(
             degrees_of_freedom=degrees_of_freedom,
             chi_squared=chi_squared,
             reduced_chi_squared=float("nan"),
-            chi_squared_p_value=None,
+            weighted_residual_rms=float("nan"),
             maximum_absolute_whitened_residual=maximum,
-            quality=ReadoutMistFitQuality.NOT_ASSESSED,
-            reason=(
-                "Absolute goodness-of-fit requires positive residual degrees of "
-                "freedom."
-            ),
         )
     reduced = chi_squared / degrees_of_freedom
-    p_value = float(chi2.sf(chi_squared, degrees_of_freedom))
-    accepted = bool(
-        reduced <= GOODNESS_OF_FIT_REDUCED_CHI_SQUARED_LIMIT
-        and maximum <= GOODNESS_OF_FIT_MAX_RESIDUAL_LIMIT
-    )
-    reason = None
-    if not accepted:
-        reason = (
-            "Whitened residuals exceed the conservative absolute fit limits "
-            f"(reduced chi-squared={reduced:.3g}, max |r|={maximum:.3g})."
-        )
     return FitGoodnessOfFit(
         degrees_of_freedom=degrees_of_freedom,
         chi_squared=chi_squared,
         reduced_chi_squared=reduced,
-        chi_squared_p_value=p_value,
+        weighted_residual_rms=float(np.sqrt(reduced)),
         maximum_absolute_whitened_residual=maximum,
-        quality=(
-            ReadoutMistFitQuality.ACCEPTED
-            if accepted
-            else ReadoutMistFitQuality.STATISTICAL_MISMATCH
-        ),
-        reason=reason,
     )
-
-
-def _local_covariance(
-    jacobian: NDArray[np.float64],
-    *,
-    reduced_chi_squared: float,
-) -> NDArray[np.float64]:
-    """Return covariance on the numerically identifiable parameter subspace."""
-    covariance, _, _, _, _ = _jacobian_diagnostics(
-        jacobian,
-        reduced_chi_squared=reduced_chi_squared,
-    )
-    return covariance
 
 
 def _jacobian_diagnostics(
     jacobian: NDArray[np.float64],
-    *,
-    reduced_chi_squared: float,
 ) -> tuple[
     NDArray[np.float64],
     NDArray[np.float64],
@@ -749,10 +675,7 @@ def _jacobian_diagnostics(
         if rank > 0
         else np.zeros((parameter_count, parameter_count), dtype=np.float64)
     )
-    covariance = np.asarray(
-        0.5 * (covariance + covariance.T) * max(1.0, reduced_chi_squared),
-        dtype=np.float64,
-    )
+    covariance = np.asarray(0.5 * (covariance + covariance.T), dtype=np.float64)
     return (
         covariance,
         np.asarray(singular_values, dtype=np.float64),
@@ -795,7 +718,9 @@ def fit_full_gls(
     A converged central estimate remains successful for a rank-deficient
     Jacobian. In that case, `covariance` contains the pseudo-covariance on the
     identifiable subspace; callers must use `null_space` when deciding whether
-    a derived physical quantity has a meaningful local uncertainty.
+    a derived physical quantity has a meaningful local uncertainty. Residual
+    degrees of freedom use the numerical Jacobian rank rather than the nominal
+    parameter count.
     """
     if isinstance(parameter_count, bool) or not isinstance(parameter_count, Integral):
         raise TypeError("parameter_count must be a positive integer.")
@@ -843,11 +768,7 @@ def fit_full_gls(
         )
     _, final, whitened = min(solutions, key=lambda item: item[0])
     jacobian = np.asarray(final.jac, dtype=np.float64)
-    dof = max(1, whitened.size - parameter_count)
-    covariance, singular_values, rank, null_space, _ = _jacobian_diagnostics(
-        jacobian,
-        reduced_chi_squared=float(whitened @ whitened) / dof,
-    )
+    covariance, singular_values, rank, null_space, _ = _jacobian_diagnostics(jacobian)
     covariance_available = bool(
         np.all(np.isfinite(covariance)) and rank == parameter_count
     )
@@ -858,7 +779,7 @@ def fit_full_gls(
         whitened_residual=whitened,
         goodness_of_fit=assess_goodness_of_fit(
             whitened,
-            n_parameters=parameter_count,
+            n_parameters=rank,
         ),
         message=(
             str(final.message)
@@ -881,9 +802,6 @@ def fit_full_gls(
 
 _PARAMETER_COUNT = 12
 _INITIAL_ANCHORS = {"initial_g": 0, "initial_e": 1, "initial_f": 2}
-_GEF_OBJECTIVE_WARNING_THRESHOLD = 100.0
-_GEF_CONDITION_NUMBER_WARNING_THRESHOLD = 1e10
-_MODEL_SELECTION_DELTA_AICC = 6.0
 _ESTIMABILITY_RELATIVE_TOLERANCE = 1e-7
 
 
@@ -1181,21 +1099,19 @@ def _numerical_jacobian(
 def _estimate(
     value: float,
     variance: float,
+    *,
+    estimable: bool,
 ) -> ProbabilityEstimate:
-    """Build a probability estimate and local resolution status."""
+    """Build a probability estimate with local GLS uncertainty."""
     standard_error = (
-        float(np.sqrt(max(variance, 0.0))) if np.isfinite(variance) else None
+        float(np.sqrt(max(variance, 0.0)))
+        if estimable and np.isfinite(variance)
+        else None
     )
-    if standard_error is None:
-        status = ReadoutMistProbabilityStatus.PARTIALLY_UNRESOLVED
-    elif value <= 2.0 * standard_error:
-        status = ReadoutMistProbabilityStatus.CONSISTENT_WITH_ZERO
-    else:
-        status = ReadoutMistProbabilityStatus.RESOLVED
     return ProbabilityEstimate(
         value=float(value),
         standard_error=standard_error,
-        status=status,
+        estimable=estimable,
     )
 
 
@@ -1208,11 +1124,15 @@ def _derived_estimate(
 ) -> ProbabilityEstimate:
     """Propagate uncertainty for an independently tested linear metric."""
     parameter_gradient = weights @ physical_transform[: len(TRANSITION_ORDER)]
-    if not _gradient_is_estimable(parameter_gradient, null_space):
-        return _estimate(float(weights @ physical[:6]), float("nan"))
+    estimable = _gradient_is_estimable(parameter_gradient, null_space)
     return _estimate(
         float(weights @ physical[:6]),
-        float(parameter_gradient @ parameter_covariance @ parameter_gradient),
+        (
+            float(parameter_gradient @ parameter_covariance @ parameter_gradient)
+            if estimable
+            else float("nan")
+        ),
+        estimable=estimable,
     )
 
 
@@ -1241,7 +1161,7 @@ def _failed_fit(
         name: ProbabilityEstimate(
             value=float("nan"),
             standard_error=None,
-            status=ReadoutMistProbabilityStatus.FIT_FAILED,
+            estimable=False,
         )
         for name in TRANSITION_ORDER
     }
@@ -1249,10 +1169,8 @@ def _failed_fit(
         degrees_of_freedom=0,
         chi_squared=float("nan"),
         reduced_chi_squared=float("nan"),
-        chi_squared_p_value=None,
+        weighted_residual_rms=float("nan"),
         maximum_absolute_whitened_residual=float("nan"),
-        quality=ReadoutMistFitQuality.NOT_ASSESSED,
-        reason=message,
     )
     return ReadoutMistMatrixFit(
         success=False,
@@ -1409,13 +1327,13 @@ def _fit_model_condition(
             transition_estimates[name] = ProbabilityEstimate(
                 value=float(physical[index]),
                 standard_error=None,
-                status=ReadoutMistProbabilityStatus.NOMINAL_ZERO_UNRESOLVED,
-                uncertainty_method="fixed_by_model",
+                estimable=False,
             )
         else:
             transition_estimates[name] = _estimate(
                 physical[index],
                 raw_covariance[index, index] if estimable[name] else float("nan"),
+                estimable=estimable[name],
             )
     transition_index = {name: index for index, name in enumerate(TRANSITION_ORDER)}
 
@@ -1483,74 +1401,6 @@ def _fit_condition(
         covariance_rcond=covariance_rcond,
         spec=_FULL_MODEL,
     )
-
-
-def _population_model_warnings(
-    measurements: ReadoutMistMeasurements,
-) -> tuple[ReadoutMistWarning, ...]:
-    """Detect GEF boundary, conditioning, and model-mismatch diagnostics."""
-    unconstrained_affected = []
-    boundary_affected = []
-    fit_affected = []
-    for protocol, measured in measurements.protocols.items():
-        for label, series in (
-            ("actual", measured.actual),
-            ("reference", measured.reference),
-        ):
-            if series is None:
-                continue
-            if np.any(series.population_unconstrained < -0.02) or np.any(
-                series.population_unconstrained > 1.02
-            ):
-                unconstrained_affected.append(f"{label}/{protocol}")
-            if np.any(series.population <= 1e-10):
-                boundary_affected.append(f"{label}/{protocol}")
-            if any(
-                diagnostic.design_rank < 2
-                or diagnostic.design_condition_number
-                > _GEF_CONDITION_NUMBER_WARNING_THRESHOLD
-                # The GEF estimator has nominally 15 feature observations and
-                # two population degrees of freedom. This deliberately loose
-                # threshold flags only gross residual mismatch.
-                or diagnostic.objective > _GEF_OBJECTIVE_WARNING_THRESHOLD
-                for diagnostic in series.fit_diagnostics
-            ):
-                fit_affected.append(f"{label}/{protocol}")
-    warnings = []
-    if unconstrained_affected:
-        warnings.append(
-            ReadoutMistWarning(
-                code="possible_higher_level_leakage",
-                message=(
-                    "GEF sum-to-one estimates disagree with unconstrained population "
-                    "fits; higher-level population or calibration mismatch may be "
-                    "present."
-                ),
-                affected_outputs=tuple(unconstrained_affected),
-            )
-        )
-    if boundary_affected:
-        warnings.append(
-            ReadoutMistWarning(
-                code="population_fit_on_boundary",
-                message=(
-                    "At least one constrained GEF estimate lies on the simplex boundary."
-                ),
-                affected_outputs=tuple(boundary_affected),
-            )
-        )
-    if fit_affected:
-        warnings.append(
-            ReadoutMistWarning(
-                code="gef_population_model_mismatch",
-                message=(
-                    "At least one GEF estimator has poor rank, conditioning, or "
-                    "residual objective; inspect the retained raw IQ and residuals."
-                ),
-                affected_outputs=tuple(fit_affected),
-            )
-        )
-    return tuple(warnings)
 
 
 def _validate_profile_confidence_level(value: float) -> float:
@@ -1621,29 +1471,7 @@ def _compare_transition_models(
         )
         for name, fit in fits.items()
     }
-    eligible = [
-        candidate
-        for candidate in candidates.values()
-        if candidate.delta_aicc <= _MODEL_SELECTION_DELTA_AICC
-        and candidate.fit.fit_quality is ReadoutMistFitQuality.ACCEPTED
-    ]
-    selected = (
-        min(
-            eligible,
-            key=lambda candidate: (
-                candidate.fit.free_parameter_count,
-                candidate.aicc,
-                candidate.fit.model_name,
-            ),
-        ).fit.model_name
-        if eligible
-        else None
-    )
-    return ReadoutMistModelComparison(
-        candidates=candidates,
-        selected_model=selected,
-        delta_aicc_threshold=_MODEL_SELECTION_DELTA_AICC,
-    )
+    return ReadoutMistModelComparison(candidates=candidates)
 
 
 def _profile_upper_bound(
@@ -1658,8 +1486,6 @@ def _profile_upper_bound(
     """Find a one-sided conditional profile-likelihood upper bound."""
     if not full_fit.success:
         return None, "central_fit_failed"
-    if full_fit.fit_quality is not ReadoutMistFitQuality.ACCEPTED:
-        return None, "fit_quality_not_accepted"
     estimate = full_fit.transition_probabilities[transition_name]
     lower = float(np.clip(estimate.value, 0.0, 1.0 - 1e-9))
     threshold = float(chi2.ppf(2.0 * confidence_level - 1.0, df=1))
@@ -1720,11 +1546,9 @@ def _add_profile_upper_bounds(
     fit: ReadoutMistMatrixFit,
     confidence_level: float,
 ) -> ReadoutMistMatrixFit:
-    """Attach bounds to transitions not resolved from zero by local covariance."""
+    """Attach one-sided profile bounds to every transition probability."""
     estimates = dict(fit.transition_probabilities)
     for name, estimate in estimates.items():
-        if estimate.status is ReadoutMistProbabilityStatus.RESOLVED:
-            continue
         upper_bound, reason = _profile_upper_bound(
             measurements,
             reference=reference,
@@ -1733,25 +1557,13 @@ def _add_profile_upper_bounds(
             transition_name=name,
             confidence_level=confidence_level,
         )
-        status = estimate.status
-        method = estimate.uncertainty_method
-        if upper_bound is not None:
-            method = (
-                "profile_likelihood"
-                if estimate.standard_error is None
-                else "local_gls_and_profile_likelihood"
-            )
-            if estimate.standard_error is None:
-                status = ReadoutMistProbabilityStatus.UPPER_BOUND_ONLY
         estimates[name] = replace(
             estimate,
-            status=status,
             upper_bound=upper_bound,
             upper_bound_confidence_level=(
                 confidence_level if upper_bound is not None else None
             ),
-            uncertainty_method=method,
-            unavailable_reason=reason,
+            upper_bound_unavailable_reason=reason,
         )
     return replace(fit, transition_probabilities=estimates)
 
@@ -1765,11 +1577,35 @@ def analyze_readout_mist(
     fit_reduced_models: bool = False,
 ) -> ReadoutMistAnalysis:
     """
-    Fit full MIST dynamics and optional profile/reduced-model diagnostics.
+    Fit full MIST dynamics with optional advanced postprocessing.
 
-    Profile upper bounds and local covariance treat the supplied GEF calibration
-    as fixed. Reduced models are diagnostic candidates; the primary `actual` and
-    `reference` results always use the full six-transition model.
+    Parameters
+    ----------
+    measurements : ReadoutMistMeasurements
+        Actual and optional blank-reference GEF population trajectories.
+    covariance_rcond : float, optional
+        Relative covariance eigenvalue cutoff in `[0, 1)`.
+    compute_profile_upper_bounds : bool, optional
+        Whether to add one-sided profile-likelihood upper bounds to all six
+        transition probabilities.
+    profile_confidence_level : float, optional
+        Confidence level strictly between 0.5 and 1 for profile bounds.
+    fit_reduced_models : bool, optional
+        Whether to fit the predefined `adjacent_only` and `no_leakage`
+        candidates and report their AICc differences.
+
+    Returns
+    -------
+    ReadoutMistAnalysis
+        Full-model fits and any requested advanced postprocessing results.
+
+    Notes
+    -----
+    Profile upper bounds and unscaled local covariance treat the supplied GEF
+    calibration as fixed. Set the advanced options only when profile bounds or
+    AICc candidate comparisons are needed. The primary `actual` and `reference`
+    results always use the full six-transition model, and model selection is left
+    to the caller.
     """
     for name, value in (
         ("compute_profile_upper_bounds", compute_profile_upper_bounds),
@@ -1842,56 +1678,10 @@ def analyze_readout_mist(
         if reference is not None and reference.success and actual.success
         else None
     )
-    warnings = []
-    for label, fit in (("actual", actual), ("reference", reference)):
-        if fit is None:
-            continue
-        if not fit.success:
-            warnings.append(
-                ReadoutMistWarning(
-                    code="fit_failed",
-                    message=f"The {label} transition-matrix fit failed: {fit.message}",
-                )
-            )
-            continue
-        if fit.fit_quality == ReadoutMistFitQuality.STATISTICAL_MISMATCH:
-            warnings.append(
-                ReadoutMistWarning(
-                    code="non_markovian_population_dynamics",
-                    message=(
-                        f"A single stochastic matrix does not explain the {label} "
-                        "population trajectories within shot-noise covariance."
-                    ),
-                )
-            )
-        unresolved = tuple(
-            name
-            for name, estimate in fit.transition_probabilities.items()
-            if estimate.status
-            in {
-                ReadoutMistProbabilityStatus.CONSISTENT_WITH_ZERO,
-                ReadoutMistProbabilityStatus.UPPER_BOUND_ONLY,
-                ReadoutMistProbabilityStatus.NOMINAL_ZERO_UNRESOLVED,
-                ReadoutMistProbabilityStatus.PARTIALLY_UNRESOLVED,
-            }
-        )
-        if unresolved:
-            warnings.append(
-                ReadoutMistWarning(
-                    code="transition_probability_unresolved",
-                    message=(
-                        f"Some {label} transition probabilities are not resolved from "
-                        "zero."
-                    ),
-                    affected_outputs=unresolved,
-                )
-            )
-    warnings.extend(_population_model_warnings(measurements))
     return ReadoutMistAnalysis(
         actual=actual,
         reference=reference,
         reference_difference=difference,
-        warnings=tuple(warnings),
         actual_model_comparison=actual_comparison,
         reference_model_comparison=reference_comparison,
         metadata={
@@ -1900,24 +1690,22 @@ def analyze_readout_mist(
             "state_order": STATE_ORDER,
             "probability_unit": "1/readout_cycle",
             "initial_condition_treatment": "latent_nuisance_with_n0_observation",
-            "uncertainty": "local_gls_conditional_on_gef_calibration",
+            "uncertainty": "unscaled_local_gls_conditional_on_gef_calibration",
             "reference_interpretation": (
                 "duration_matched_blank_cycle_diagnostic" if has_reference else None
             ),
             "profile_upper_bounds": compute_profile_upper_bounds,
-            "profile_confidence_level": confidence_level,
-            "reduced_model_comparison": fit_reduced_models,
-            "gef_objective_warning_threshold": _GEF_OBJECTIVE_WARNING_THRESHOLD,
-            "gef_condition_number_warning_threshold": (
-                _GEF_CONDITION_NUMBER_WARNING_THRESHOLD
+            "profile_confidence_level": (
+                confidence_level if compute_profile_upper_bounds else None
             ),
+            "reduced_model_comparison": fit_reduced_models,
         },
     )
 
 
 # Acquisition, presentation, and public workflow
 
-DEFAULT_REPETITION_COUNTS = (0, 1, 2, 4, 8, 16, 32, 64, 128)
+DEFAULT_REPETITION_COUNTS = (0, 1, 2, 4, 8, 16, 32, 64, 128, 256)
 DEFAULT_GEF_MEASUREMENT_N_SHOTS = 4096
 DEFAULT_GEF_CALIBRATION_N_SHOTS = 8192
 
@@ -2058,6 +1846,19 @@ def _fitted_populations_on_integer_grid(
     return trajectories
 
 
+def _fit_diagnostic_text(fit: ReadoutMistMatrixFit) -> str:
+    """Format objective fit metrics without assigning a quality category."""
+    if not fit.success:
+        return f"optimizer=failed, rank={fit.jacobian_rank}/{fit.free_parameter_count}"
+    goodness = fit.goodness_of_fit
+    return (
+        f"optimizer=success, χ²/DoF={goodness.reduced_chi_squared:.3g}, "
+        f"WRMS={goodness.weighted_residual_rms:.3g}, "
+        f"max|r_w|={goodness.maximum_absolute_whitened_residual:.3g}, "
+        f"rank={fit.jacobian_rank}/{fit.free_parameter_count}"
+    )
+
+
 def _population_figure(
     measurements: ReadoutMistMeasurements,
     analysis: ReadoutMistAnalysis,
@@ -2159,7 +1960,16 @@ def _population_figure(
         )
     figure.update_xaxes(title_text="Readout repetitions (n)", row=3, col=1)
     figure.update_layout(
-        title="Readout-induced state transitions",
+        title=(
+            "Readout-induced state transitions"
+            f"<br><sup>Actual: {_fit_diagnostic_text(analysis.actual)}"
+            + (
+                f" | Reference: {_fit_diagnostic_text(analysis.reference)}"
+                if analysis.reference is not None
+                else ""
+            )
+            + "</sup>"
+        ),
         template="plotly_white",
         height=850,
     )
@@ -2211,9 +2021,19 @@ def _transition_matrix_text(fit: ReadoutMistMatrixFit) -> NDArray[np.str_]:
 
 def _matrix_figure(analysis: ReadoutMistAnalysis) -> go.Figure:
     """Compare actual/reference matrices on a low-probability-focused scale."""
-    conditions = [("Actual", analysis.actual)]
+    conditions = [
+        (
+            f"Actual<br><sup>{_fit_diagnostic_text(analysis.actual)}</sup>",
+            analysis.actual,
+        )
+    ]
     if analysis.reference is not None:
-        conditions.append(("Reference", analysis.reference))
+        conditions.append(
+            (
+                f"Reference<br><sup>{_fit_diagnostic_text(analysis.reference)}</sup>",
+                analysis.reference,
+            )
+        )
     figure = make_subplots(
         rows=1,
         cols=len(conditions),
@@ -2264,56 +2084,6 @@ def _matrix_figure(analysis: ReadoutMistAnalysis) -> go.Figure:
     return figure
 
 
-def _print_summary(analysis: ReadoutMistAnalysis) -> None:
-    """Print transition probabilities and compact fit diagnostics."""
-    print("Readout MIST probabilities [1/readout_cycle]")
-    conditions = (
-        ("Actual", analysis.actual, analysis.actual_model_comparison),
-        ("Reference", analysis.reference, analysis.reference_model_comparison),
-    )
-    for label, fit, comparison in conditions:
-        if fit is None:
-            continue
-        print(f"{label}:")
-        if not fit.success:
-            print(f"  fit failed: {fit.message}")
-            continue
-        for name in TRANSITION_ORDER:
-            estimate = fit.transition_probabilities[name]
-            uncertainty = (
-                f"{estimate.value:.6g}; local uncertainty unresolved"
-                if estimate.standard_error is None
-                else f"{estimate.value:.6g} ± {estimate.standard_error:.2g}"
-            )
-            if estimate.upper_bound is not None:
-                uncertainty += (
-                    f"; one-sided {estimate.upper_bound_confidence_level:.1%} "
-                    f"upper bound {estimate.upper_bound:.6g}"
-                )
-            elif estimate.unavailable_reason is not None:
-                uncertainty += f"; profile unavailable: {estimate.unavailable_reason}"
-            print(f"  {name}: {uncertainty} ({estimate.status.value})")
-        goodness = fit.goodness_of_fit
-        print(
-            "  Fit quality: "
-            f"{goodness.quality.value}; reduced chi-squared="
-            f"{goodness.reduced_chi_squared:.3g}; max |whitened residual|="
-            f"{goodness.maximum_absolute_whitened_residual:.3g}"
-        )
-        print(f"  Local Jacobian rank: {fit.jacobian_rank}/{fit.free_parameter_count}")
-        if comparison is not None:
-            print(f"  Selected candidate model: {comparison.selected_model or 'none'}")
-    if analysis.warnings:
-        print("Warnings:")
-        for warning in analysis.warnings:
-            affected = (
-                f" [{', '.join(warning.affected_outputs)}]"
-                if warning.affected_outputs
-                else ""
-            )
-            print(f"  - {warning.code}: {warning.message}{affected}")
-
-
 def characterize_readout_mist(
     exp: Experiment,
     target: str,
@@ -2326,9 +2096,6 @@ def characterize_readout_mist(
     gef_calibration_n_shots: int = DEFAULT_GEF_CALIBRATION_N_SHOTS,
     shot_interval: float | None = None,
     gef_covariance_rcond: float = 1e-12,
-    compute_profile_upper_bounds: bool = False,
-    profile_confidence_level: float = 0.95,
-    fit_reduced_models: bool = False,
     acquisition_order: Literal["interleaved", "randomized", "grouped"] = "interleaved",
     acquisition_seed: int | None = 0,
     enable_tqdm: bool = True,
@@ -2346,7 +2113,7 @@ def characterize_readout_mist(
     repetition_counts : Sequence[int] | None, optional
         Strictly increasing counts beginning with zero and containing one.
         At least five points are required. Defaults to
-        `(0, 1, 2, 4, 8, 16, 32, 64, 128)`.
+        `(0, 1, 2, 4, 8, 16, 32, 64, 128, 256)`.
     readout_cycle : PulseSchedule | None, optional
         Complete candidate cycle containing drive, optional active depletion,
         and its trailing gap. When omitted, use the configured readout pulse
@@ -2365,16 +2132,6 @@ def characterize_readout_mist(
         Shot interval in ns, or the configured measurement default.
     gef_covariance_rcond : float, optional
         Relative covariance eigenvalue cutoff in `[0, 1)`.
-    compute_profile_upper_bounds : bool, optional
-        Whether to compute one-sided conditional profile-likelihood upper bounds
-        for transition probabilities not resolved from zero. Disabled by default
-        because it requires additional nonlinear fits.
-    profile_confidence_level : float, optional
-        Confidence level strictly between 0.5 and 1 for profile upper bounds.
-        Defaults to 0.95.
-    fit_reduced_models : bool, optional
-        Whether to compare the full model with predefined `adjacent_only` and
-        `no_leakage` models using AICc. The full-model result remains primary.
     acquisition_order : {"interleaved", "randomized", "grouped"}, optional
         Logical G/E/F and repetition-point submission order. When reference
         measurement is enabled, each logical point is submitted as an adjacent
@@ -2382,10 +2139,11 @@ def characterize_readout_mist(
     acquisition_seed : int | None, optional
         Seed used only for randomized acquisition order.
     enable_tqdm : bool, optional
-        Whether acquisition services show progress bars.
+        Whether acquisition services show progress labels and bars. Enabled by
+        default.
     plot : bool, optional
-        Whether to construct and show figures and print the summary. If false,
-        the returned `figures` mapping is empty.
+        Whether to construct and show figures. If false, the returned `figures`
+        mapping is empty. This function does not print a fit summary.
 
     Returns
     -------
@@ -2397,10 +2155,12 @@ def characterize_readout_mist(
     This function performs hardware acquisition. Reported probabilities use
     `T[final_state, initial_state]` and units of `1/readout_cycle`. They are
     effective cycle-boundary probabilities rather than microscopic rates.
-    Uncertainty is local GLS covariance conditional on the shared GEF calibration;
-    local null-space directions are assessed separately for every reported
-    quantity. Optional profile bounds and AICc model comparisons are conditional
-    on the same calibration and do not include calibration bootstrap uncertainty.
+    Uncertainty is unscaled local GLS covariance conditional on the shared GEF
+    calibration; local null-space directions are assessed separately for every
+    reported quantity. Reduced chi-squared, whitened-residual RMS, maximum
+    absolute whitened residual, optimizer success, and Jacobian rank are returned
+    without assigning a fit-quality category. Calibration uncertainty is not
+    included.
     The blank reference zeros the entire candidate cycle while preserving its
     timing. Actual and reference schedules are interleaved in one population
     batch to reduce sensitivity to acquisition drift. A backend may split the
@@ -2415,13 +2175,11 @@ def characterize_readout_mist(
     requested repetition. Transition-matrix heatmaps show local standard errors
     when available and saturate their shared color scale at probability 0.1.
     Consequently, diagnostic-readout backaction and population outside the closed
-    GEF subspace remain model limitations and are surfaced through retained raw
-    data and warnings.
+    GEF subspace remain model limitations. Raw IQ, unconstrained populations, and
+    GEF fit diagnostics are retained for caller-side assessment.
     """
     for name, value in (
         ("measure_reference", measure_reference),
-        ("compute_profile_upper_bounds", compute_profile_upper_bounds),
-        ("fit_reduced_models", fit_reduced_models),
         ("enable_tqdm", enable_tqdm),
         ("plot", plot),
     ):
@@ -2442,7 +2200,6 @@ def characterize_readout_mist(
         gef_covariance_rcond,
         name="gef_covariance_rcond",
     )
-    confidence_level = _validate_profile_confidence_level(profile_confidence_level)
     seed = _optional_seed(acquisition_seed)
     configured_interval = resolve_measurement_defaults(
         exp.ctx.experiment_system.measurement_defaults
@@ -2520,17 +2277,13 @@ def characterize_readout_mist(
     analysis = analyze_readout_mist(
         measurements,
         covariance_rcond=covariance_rcond,
-        compute_profile_upper_bounds=compute_profile_upper_bounds,
-        profile_confidence_level=confidence_level,
-        fit_reduced_models=fit_reduced_models,
     )
     figures = (
         {"populations": _population_figure(measurements, analysis)} if plot else {}
     )
-    if plot and analysis.actual.success:
+    if plot:
         figures["transition_matrix"] = _matrix_figure(analysis)
     if plot:
-        _print_summary(analysis)
         for figure in figures.values():
             figure.show()
     measurement_options = {
@@ -2590,11 +2343,8 @@ def characterize_readout_mist(
             "measurement_options": measurement_options,
             "analysis_options": {
                 "model": "full_six_transition_discrete_time_matrix",
-                "reduced_models": fit_reduced_models,
-                "profile_upper_bounds": compute_profile_upper_bounds,
-                "profile_confidence_level": confidence_level,
                 "calibration_bootstrap": False,
-                "uncertainty": "local_gls_conditional_on_gef_calibration",
+                "uncertainty": "unscaled_local_gls_conditional_on_gef_calibration",
             },
             "readout_cycle_timing": {
                 "duration_ns": float(cycle.duration),
@@ -2620,4 +2370,4 @@ def characterize_readout_mist(
     )
 
 
-__all__ = ["characterize_readout_mist"]
+__all__ = ["analyze_readout_mist", "characterize_readout_mist"]

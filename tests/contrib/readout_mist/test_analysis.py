@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import cast
+from typing import Any, cast
 
 import numpy as np
 import plotly.graph_objects as go
@@ -12,7 +12,6 @@ import pytest
 import qubex.contrib.experiment.readout_mist as mist_module
 from qubex.contrib.experiment.readout_mist import (
     TRANSITION_ORDER,
-    GefPopulationFitDiagnostic,
     GefPopulationSeries,
     ReadoutMistConditionMeasurements,
     ReadoutMistMeasurements,
@@ -71,7 +70,7 @@ def _measurements_from_transition(
 
 
 def test_joint_fit_recovers_transition_matrix_and_initial_populations() -> None:
-    """The full joint GLS fit should recover a known stochastic matrix."""
+    """The full fit should recover the matrix and its named transition convention."""
     measurements, expected = _synthetic_measurements()
 
     analysis = analyze_readout_mist(measurements, covariance_rcond=1e-12)
@@ -89,26 +88,23 @@ def test_joint_fit_recovers_transition_matrix_and_initial_populations() -> None:
         atol=1e-12,
     )
     assert np.all(analysis.actual.transition_matrix >= 0.0)
-    assert analysis.actual.fit_quality.value == "accepted"
+    assert analysis.actual.success
     assert analysis.actual.jacobian_rank == analysis.actual.free_parameter_count
     assert all(analysis.actual.parameter_estimable.values())
+    goodness = analysis.actual.goodness_of_fit
+    assert goodness.weighted_residual_rms == pytest.approx(
+        np.sqrt(goodness.reduced_chi_squared)
+    )
     assert analysis.metadata["reference_interpretation"] is None
-
-
-def test_transition_names_follow_final_by_initial_matrix_convention() -> None:
-    """Named probabilities should follow `T[final, initial]`."""
-    measurements, expected = _synthetic_measurements()
-
-    fit = analyze_readout_mist(measurements, covariance_rcond=1e-12).actual
-
+    assert analysis.metadata["profile_confidence_level"] is None
     np.testing.assert_allclose(
         [
-            fit.transition_probabilities["g_to_e"].value,
-            fit.transition_probabilities["e_to_g"].value,
-            fit.transition_probabilities["g_to_f"].value,
-            fit.transition_probabilities["e_to_f"].value,
-            fit.transition_probabilities["f_to_g"].value,
-            fit.transition_probabilities["f_to_e"].value,
+            analysis.actual.transition_probabilities["g_to_e"].value,
+            analysis.actual.transition_probabilities["e_to_g"].value,
+            analysis.actual.transition_probabilities["g_to_f"].value,
+            analysis.actual.transition_probabilities["e_to_f"].value,
+            analysis.actual.transition_probabilities["f_to_g"].value,
+            analysis.actual.transition_probabilities["f_to_e"].value,
         ],
         [
             expected[1, 0],
@@ -121,9 +117,9 @@ def test_transition_names_follow_final_by_initial_matrix_convention() -> None:
         rtol=1e-12,
         atol=1e-14,
     )
-    assert fit.state_order == ("g", "e", "f")
-    assert fit.probability_unit == "1/readout_cycle"
-    assert tuple(fit.transition_probabilities) == TRANSITION_ORDER
+    assert analysis.actual.state_order == ("g", "e", "f")
+    assert analysis.actual.probability_unit == "1/readout_cycle"
+    assert tuple(analysis.actual.transition_probabilities) == TRANSITION_ORDER
     assert TRANSITION_ORDER == (
         "g_to_e",
         "e_to_g",
@@ -134,8 +130,8 @@ def test_transition_names_follow_final_by_initial_matrix_convention() -> None:
     )
 
 
-def test_profile_bounds_and_reduced_models_handle_nominally_zero_transitions() -> None:
-    """Boundary transitions should get upper bounds and a simpler candidate fit."""
+def test_reduced_model_comparison_reports_candidate_aicc_values() -> None:
+    """Reduced-model analysis should report candidates without selecting one."""
     transition = np.array(
         [
             [0.990, 0.020, 0.000],
@@ -148,28 +144,55 @@ def test_profile_bounds_and_reduced_models_handle_nominally_zero_transitions() -
 
     analysis = analyze_readout_mist(
         measurements,
-        compute_profile_upper_bounds=True,
-        profile_confidence_level=0.95,
         fit_reduced_models=True,
     )
 
-    for name in ("g_to_f", "f_to_g"):
-        estimate = analysis.actual.transition_probabilities[name]
-        assert estimate.upper_bound is not None
-        assert estimate.upper_bound >= estimate.value
-        assert estimate.upper_bound_confidence_level == pytest.approx(0.95)
-        assert estimate.status.value == "upper_bound_only"
-    for name in ("g_to_e", "e_to_g", "e_to_f", "f_to_e"):
-        assert analysis.actual.transition_probabilities[name].status.value == "resolved"
     comparison = analysis.actual_model_comparison
     assert comparison is not None
     assert set(comparison.candidates) == {"full", "adjacent_only", "no_leakage"}
     assert comparison.candidates["full"].fit is analysis.actual
-    assert comparison.selected_model == "adjacent_only"
-    adjacent = comparison.candidates["adjacent_only"].fit
-    assert adjacent.transition_probabilities["g_to_f"].status.value == (
-        "nominal_zero_unresolved"
+    assert (
+        min(
+            comparison.candidates.values(),
+            key=lambda candidate: candidate.aicc,
+        ).fit.model_name
+        == "adjacent_only"
     )
+    adjacent = comparison.candidates["adjacent_only"].fit
+    assert not adjacent.transition_probabilities["g_to_f"].estimable
+    assert adjacent.transition_probabilities["g_to_f"].standard_error is None
+
+
+def test_profile_upper_bound_solves_a_known_quadratic_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Profile search should find the one-sided threshold for a known objective."""
+    measurements, _ = _synthetic_measurements()
+    full_fit = analyze_readout_mist(measurements).actual
+    estimate = full_fit.transition_probabilities["g_to_f"].value
+    scale = 0.02
+
+    def fit_quadratic_profile(*args: object, **kwargs: Any):
+        spec = kwargs["spec"]
+        probability = dict(spec.fixed_probabilities)["g_to_f"]
+        return replace(
+            full_fit,
+            objective=full_fit.objective + ((probability - estimate) / scale) ** 2,
+        )
+
+    monkeypatch.setattr(mist_module, "_fit_model_condition", fit_quadratic_profile)
+
+    upper_bound, reason = _profile_upper_bound(
+        measurements,
+        reference=False,
+        covariance_rcond=1e-12,
+        full_fit=full_fit,
+        transition_name="g_to_f",
+        confidence_level=0.95,
+    )
+
+    assert reason is None
+    assert upper_bound == pytest.approx(estimate + 0.032897, abs=2e-6)
 
 
 def test_profile_fit_failure_does_not_create_a_false_upper_bound(
@@ -210,6 +233,7 @@ def test_population_figure_evaluates_fit_at_every_integer_repetition() -> None:
         np.asarray(fit_trace.x),
         np.arange(int(measurements.repetition_counts[-1]) + 1),
     )
+    assert "WRMS=" in figure.layout.title.text
 
 
 def test_matrix_figure_compares_actual_and_reference_with_uncertainty() -> None:
@@ -239,10 +263,9 @@ def test_matrix_figure_compares_actual_and_reference_with_uncertainty() -> None:
     )
     assert figure.layout.coloraxis.cmin == pytest.approx(0.0)
     assert figure.layout.coloraxis.cmax == pytest.approx(0.1)
-    assert [annotation.text for annotation in figure.layout.annotations] == [
-        "Actual",
-        "Reference",
-    ]
+    annotation_text = [annotation.text for annotation in figure.layout.annotations]
+    assert annotation_text[0].startswith("Actual<br><sup>optimizer=success, χ²/DoF=")
+    assert annotation_text[1].startswith("Reference<br><sup>optimizer=success, χ²/DoF=")
     for trace in traces:
         text = np.asarray(trace.text)
         assert "±" in text[0, 0]
@@ -291,19 +314,6 @@ def test_measurements_reject_partial_reference_data() -> None:
 
     with pytest.raises(ValueError, match="all protocols or none"):
         ReadoutMistMeasurements(measurements.repetition_counts, protocols)
-
-
-def test_gef_diagnostic_allows_infinite_condition_number() -> None:
-    """A singular GEF design should remain representable for warning generation."""
-    diagnostic = GefPopulationFitDiagnostic(
-        objective=0.0,
-        design_rank=1,
-        design_condition_number=float("inf"),
-        residual=np.zeros(3),
-        message="singular design",
-    )
-
-    assert np.isinf(diagnostic.design_condition_number)
 
 
 def test_failed_fit_keeps_the_parameter_covariance_schema(
